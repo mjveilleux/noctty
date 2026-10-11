@@ -7495,6 +7495,12 @@ pub const App = struct {
                     return true;
                 }
 
+                // A key press on the pane and the palette both target the
+                // surface. The default binding is performable, so report that
+                // nothing was undone and the chord goes on to the program in
+                // the pane (the palette says so itself, see invokePaletteRow).
+                // An app-level request gets the banner.
+                if (target == .surface) return false;
                 _ = try self.showHostBanner(.{ .surface = surface.core() }, .info, "Nothing to undo.");
                 return true;
             },
@@ -7537,6 +7543,9 @@ pub const App = struct {
                     return true;
                 }
 
+                // See undo: a surface-targeted request with nothing to redo
+                // is not performed, so a performable binding lets the key through.
+                if (target == .surface) return false;
                 _ = try self.showHostBanner(.{ .surface = surface.core() }, .info, "Nothing to redo.");
                 return true;
             },
@@ -9599,9 +9608,10 @@ pub const App = struct {
                     host.refocusHostWindow();
                     runUiActionOrLog("tab close layout failed", host.layout());
                     runUiActionOrLog("tab close chrome refresh failed", host.refreshChrome());
+                    var hint_buf: [96]u8 = undefined;
                     runUiActionOrLog(
                         "tab close banner failed",
-                        host.setBanner(.info, "Tab closed. Use undo to restore it."),
+                        host.setBanner(.info, labels.tabClosedMessage(&self.config.keybind.set, &hint_buf)),
                     );
                 }
                 return true;
@@ -14618,7 +14628,7 @@ const Host = struct {
             self.postDeferredNewTab();
             return;
         }
-        _ = surface.core_surface.performBindingAction(action) catch |err| {
+        const performed = surface.core_surface.performBindingAction(action) catch |err| {
             if (outcome_provider) |provider| {
                 win32_uia.events.raiseNotification(
                     provider,
@@ -14628,7 +14638,15 @@ const Host = struct {
             }
             return err;
         };
-        // Do NOT touch `self` after dispatch — the host may be freed.
+        // Do NOT touch `self` after dispatch — the host may be freed. The one
+        // exception is an undo or redo that did nothing: nothing was freed, and
+        // a palette request, unlike the performable key, owes an answer.
+        if (!performed and (action == .undo or action == .redo)) {
+            runUiActionOrLog(
+                "palette undo banner failed",
+                self.setBanner(.info, if (action == .undo) "Nothing to undo." else "Nothing to redo."),
+            );
+        }
     }
 
     fn postDeferredNewTab(self: *Host) void {
@@ -18070,7 +18088,7 @@ const Host = struct {
         // A chosen command moves focus itself (new tab, palette, find), so
         // only the dismissed case needs the terminal restored, and only
         // when the pointer opened the menu. A keyboard user who reached
-        // the chevron with F6 and opened it with Space expects Escape to
+        // the chevron with Ctrl+F6 and opened it with Space expects Escape to
         // put them back on the chevron, as every menu does.
         if (cmd <= 0 and self.focus_input_mode == .pointer and sys.GetFocus() == button) {
             refocusHostAfterActivation(self);
@@ -18196,7 +18214,7 @@ const Host = struct {
     /// The region a focused HWND belongs to, or null when focus is
     /// somewhere this cycle does not own (an overlay, the palette, a
     /// settings window). The tab-strip action buttons count as the tab
-    /// strip so F6 from them continues the cycle instead of dead-ending.
+    /// strip so Ctrl+F6 from them continues the cycle instead of dead-ending.
     fn focusRegionForHwnd(self: *Host, child: HWND) ?focus_region.Region {
         for (self.app.windows.items) |surface| {
             if (surface.host != self) continue;
@@ -18240,7 +18258,7 @@ const Host = struct {
     /// resolved from live focus rather than assumed, so a binding invoked
     /// through automation while chrome holds focus still moves correctly.
     fn cycleFocusRegionFromCurrentFocus(self: *Host, direction: focus_region.Direction) bool {
-        // This is the keybind path (F6 from the terminal). The key never
+        // This is the keybind path (Ctrl+F6 from the terminal). The key never
         // reaches a chrome control's own WM_KEYDOWN, but the control it
         // lands on is being reached by keyboard and must show its ring.
         self.focus_input_mode = .keyboard;
@@ -18248,7 +18266,7 @@ const Host = struct {
         return self.cycleFocusRegion(direction, current);
     }
 
-    /// F6 / Shift+F6 and Escape while a chrome region holds focus.
+    /// Ctrl+F6 / Ctrl+Shift+F6 and Escape while a chrome region holds focus.
     ///
     /// Chrome controls are native HWNDs that never reach the core keybind
     /// path, so these keys are fixed here rather than rebindable; the
@@ -18258,10 +18276,13 @@ const Host = struct {
     fn handleFocusRegionKey(self: *Host, child: HWND, vk: WPARAM, allow_escape: bool) bool {
         const current = self.focusRegionForHwnd(child) orelse return false;
         switch (vk) {
-            c.VK_F6 => return self.cycleFocusRegion(
-                if (keyPressed(c.VK_SHIFT)) .previous else .next,
-                current,
-            ),
+            c.VK_F6 => {
+                const direction = focus_region.chordDirection(
+                    keyPressed(c.VK_CONTROL),
+                    keyPressed(c.VK_SHIFT),
+                ) orelse return false;
+                return self.cycleFocusRegion(direction, current);
+            },
             c.VK_ESCAPE => {
                 if (!allow_escape) return false;
                 const target = focus_region.escapeTarget(
@@ -26891,7 +26912,7 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         // focus-region cycle.
         if (msg == c.WM_KEYDOWN and !v.isOverlayButton(hwnd)) {
             // The docked search buttons already own Escape (it dismisses
-            // the search), so only F6 is taken from them here.
+            // the search), so only Ctrl+F6 is taken from them here.
             const allow_escape = v.searchControlSurface(hwnd) == null;
             if (v.handleFocusRegionKey(hwnd, wParam, allow_escape)) return 0;
         }
@@ -27326,7 +27347,7 @@ fn searchEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
                 v.noteChromeKeyInput(wParam);
                 // Escape stays with the search bar, which dismisses
-                // itself and returns focus to the terminal; only F6
+                // itself and returns focus to the terminal; only Ctrl+F6
                 // is taken for the focus-region cycle.
                 if (v.handleFocusRegionKey(hwnd, wParam, false)) return 0;
                 if (wParam == c.VK_RETURN) {
@@ -35618,6 +35639,35 @@ test "win32 undo redo actions prune expired empty-host structural history before
     try std.testing.expect(try app.performAction(.app, .redo, {}));
     try std.testing.expectEqual(@as(usize, 0), host.structural_redo_entries.items.len);
     try std.testing.expectEqualStrings("Nothing to redo.", host.banner_text.?);
+}
+
+test "win32 undo and redo aimed at a surface with nothing to do are not performed" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{.{ .storage = &surface, .host = &host, .register = true }},
+        .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+
+    // A key press on the pane and the palette aim at the surface. The default
+    // bindings are performable, so nothing to undo or redo must report false
+    // and say nothing: the chord then goes on to the program in the pane.
+    try std.testing.expect(!try app.performAction(.{ .surface = surface.core() }, .undo, {}));
+    try std.testing.expect(!try app.performAction(.{ .surface = surface.core() }, .redo, {}));
+    try std.testing.expect(host.banner_text == null);
+
+    // An app-level request has no key to hand back, so it answers.
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    try std.testing.expectEqualStrings("Nothing to undo.", host.banner_text.?);
 }
 
 test "win32 local undo capture invalidates host structural redo only" {

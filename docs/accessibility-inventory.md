@@ -35,7 +35,7 @@ rows, context menus, WinRT toasts, the tab drag preview, and
 quick-terminal chrome.
 
 Keyboard reachability is a focus-region cycle: `cycle_focus_region`
-(F6 / Shift+F6 by default) moves real Win32 focus between the terminal
+(Ctrl+F6 / Ctrl+Shift+F6 by default) moves real Win32 focus between the terminal
 pane, the tab strip, the docked search query, and the host banner,
 skipping regions that are not on screen; Escape returns to the terminal.
 The order and the skip rule live in `src/apprt/win32/focus_region.zig`

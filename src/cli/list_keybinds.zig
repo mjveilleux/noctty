@@ -448,3 +448,24 @@ test "list-keybinds action help describes docs mode truthfully" {
     try std.testing.expect(std.mem.indexOf(u8, help_strings.Action.@"list-keybinds", "currently does nothing") == null);
     try std.testing.expect(std.mem.indexOf(u8, help_strings.Action.@"list-keybinds", "On a TTY this also forces plain text output.") != null);
 }
+
+test "list-keybinds --default prints the Windows default keymap" {
+    // The snapshot is the plain output of `noctty +list-keybinds --default`.
+    // Change a default and this fails: regenerate the file from the new output
+    // (`noctty +list-keybinds --default --plain > src/cli/testdata/default_keybinds_windows.txt`
+    // from a copy of the build) after checking every changed line.
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var config = try Config.default(alloc);
+    defer config.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try config.keybind.formatEntryDocs(configpkg.entryFormatter("keybind", &out.writer), false);
+
+    try std.testing.expectEqualStrings(
+        @embedFile("testdata/default_keybinds_windows.txt"),
+        out.written(),
+    );
+}

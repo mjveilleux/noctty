@@ -1,9 +1,10 @@
 //! Keyboard focus-region model for the Win32 host window.
 //!
-//! Windows convention is F6 / Shift+F6 to move keyboard focus between the
-//! panes of a window's chrome. This module owns the cycle order and the
-//! rule for skipping a region that is not currently on screen, as pure
-//! data so it can be tested without a window. `win32.zig` owns the
+//! Ctrl+F6 / Ctrl+Shift+F6 (the Windows chord for moving between the windows
+//! of an application; a bare F6 belongs to the program in the pane) move
+//! keyboard focus between the regions of a window. This module owns the cycle
+//! order and the rule for skipping a region that is not currently on screen,
+//! as pure data so it can be tested without a window. `win32.zig` owns the
 //! mapping from a region to the HWND that actually takes focus, because
 //! only real Win32 focus raises a UIA focus-changed event.
 
@@ -25,6 +26,15 @@ pub const Direction = enum {
     next,
     previous,
 };
+
+/// The direction a key press asks for while chrome holds focus: Ctrl+F6 goes
+/// forward and Ctrl+Shift+F6 back, the chords the `cycle_focus_region`
+/// keybind defaults to. Chrome controls never reach the keybind table, so
+/// they answer the default chords. A bare F6 asks for nothing.
+pub fn chordDirection(ctrl: bool, shift: bool) ?Direction {
+    if (!ctrl) return null;
+    return if (shift) .previous else .next;
+}
 
 /// Which regions can take focus right now. A region whose HWND does not
 /// exist, or exists but is hidden, is not available and is skipped rather
@@ -222,4 +232,11 @@ test "escape returns to the terminal only from chrome" {
 
     const no_terminal: Availability = .{ .tab_strip = true };
     try std.testing.expectEqual(@as(?Region, null), escapeTarget(no_terminal, .tab_strip));
+}
+
+test "the chrome answers Ctrl+F6 and Ctrl+Shift+F6, not a bare F6" {
+    try std.testing.expectEqual(Direction.next, chordDirection(true, false).?);
+    try std.testing.expectEqual(Direction.previous, chordDirection(true, true).?);
+    try std.testing.expectEqual(@as(?Direction, null), chordDirection(false, false));
+    try std.testing.expectEqual(@as(?Direction, null), chordDirection(false, true));
 }

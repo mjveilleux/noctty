@@ -1818,7 +1818,7 @@ function Wait-AccessibilityFocusRegionLanding(
         }
 }
 
-# Drives the keyboard focus-region cycle (F6 / Shift+F6 / Escape) over the
+# Drives the keyboard focus-region cycle (Ctrl+F6 / Ctrl+Shift+F6 / Escape) over the
 # regions this scenario actually has on screen: the terminal pane and the
 # tab strip. Leaves focus back on $TerminalHwnd.
 function Invoke-AccessibilityFocusRegionCycle(
@@ -1838,15 +1838,15 @@ function Invoke-AccessibilityFocusRegionCycle(
 
     # Forward: terminal -> tab strip.
     Send-AccessibilityChord `
-        -Keys @([uint16]0x75) `
-        -Description 'F6 focus-region cycle into the tab strip' `
+        -Keys @([uint16]0x11, [uint16]0x75) `
+        -Description 'Ctrl+F6 focus-region cycle into the tab strip' `
         -Process $Process
     Wait-AccessibilityFocusRegionLanding `
         -Process $Process `
         -Expected $TabStripHwnd `
         -TerminalHwnd $TerminalHwnd `
         -TabStripHwnd $TabStripHwnd `
-        -Description 'F6 to move keyboard focus onto the tab strip'
+        -Description 'Ctrl+F6 to move keyboard focus onto the tab strip'
 
     # The landed element must not contradict the focus-changed event a
     # reader just received.
@@ -1876,31 +1876,31 @@ function Invoke-AccessibilityFocusRegionCycle(
         -TabStripHwnd $TabStripHwnd `
         -Description 'Escape to return keyboard focus to the terminal'
 
-    # Backward: Shift+F6 reaches the chrome from the other end. With no
+    # Backward: Ctrl+Shift+F6 reaches the chrome from the other end. With no
     # docked search open and no banner up, the tab strip is the only other
     # region, so both directions land there.
     Send-AccessibilityChord `
-        -Keys @([uint16]0x10, [uint16]0x75) `
-        -Description 'Shift+F6 focus-region cycle into the tab strip' `
+        -Keys @([uint16]0x11, [uint16]0x10, [uint16]0x75) `
+        -Description 'Ctrl+Shift+F6 focus-region cycle into the tab strip' `
         -Process $Process
     Wait-AccessibilityFocusRegionLanding `
         -Process $Process `
         -Expected $TabStripHwnd `
         -TerminalHwnd $TerminalHwnd `
         -TabStripHwnd $TabStripHwnd `
-        -Description 'Shift+F6 to move keyboard focus onto the tab strip'
+        -Description 'Ctrl+Shift+F6 to move keyboard focus onto the tab strip'
 
-    # F6 from the only chrome region wraps back to the terminal.
+    # Ctrl+F6 from the only chrome region wraps back to the terminal.
     Send-AccessibilityChord `
-        -Keys @([uint16]0x75) `
-        -Description 'F6 wrap from the tab strip back to the terminal' `
+        -Keys @([uint16]0x11, [uint16]0x75) `
+        -Description 'Ctrl+F6 wrap from the tab strip back to the terminal' `
         -Process $Process
     Wait-AccessibilityFocusRegionLanding `
         -Process $Process `
         -Expected $TerminalHwnd `
         -TerminalHwnd $TerminalHwnd `
         -TabStripHwnd $TabStripHwnd `
-        -Description 'F6 to wrap keyboard focus back to the terminal'
+        -Description 'Ctrl+F6 to wrap keyboard focus back to the terminal'
 
     return [ordered]@{
         terminal_hwnd = $TerminalHwnd.ToInt64()

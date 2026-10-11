@@ -86,6 +86,7 @@ Settings, Actions rather than trusting memory. Against current Noctty defaults:
 | Move between panes  | `Alt+Arrow`                   | `Alt+Arrow`                               |
 | Command palette     | `Ctrl+Shift+P`                | `Ctrl+Shift+P`                            |
 | Find                | `Ctrl+Shift+F`                | `Ctrl+Shift+F`                            |
+| Full screen         | `F11` or `Alt+Enter`          | `F11` (`Alt+Enter` goes to the program)   |
 | Font size           | `Ctrl+=` / `Ctrl+-`           | `Ctrl+=` / `Ctrl+-`                       |
 
 Most of the daily set already matches. Copy, paste, and splitting are the three

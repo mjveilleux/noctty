@@ -616,9 +616,10 @@ is not dropped: ConPTY hands the child the same bytes noctty wrote. Older
 in-box conhosts, including Windows 10 build 19045, were not measured. See the
 [key encoding differential](windows-vt-conformance.md#measured-master-to-child-key-encoding-differential).
 
-`F6` and `Shift+F6` run `cycle_focus_region` and move keyboard focus
-between the terminal pane, the tab strip, the docked search query, and the
-host banner, skipping whatever is not on screen. `Esc` returns to the
+`Ctrl+F6` and `Ctrl+Shift+F6` run `cycle_focus_region` and move keyboard
+focus between the terminal pane, the tab strip, the docked search query, and
+the host banner, skipping whatever is not on screen. A bare `F6` is left to
+the program in the pane (htop, Midnight Commander). `Esc` returns to the
 terminal. In the tab strip, Left/Right/Home/End move between tabs,
 Enter or Space activates one, `Delete` closes one, `F2` renames, and Ctrl
 with an arrow or Home/End moves the tab. These chrome keys are fixed:

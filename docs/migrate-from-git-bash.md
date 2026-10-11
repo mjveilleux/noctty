@@ -89,8 +89,8 @@ daily:
 
 | Task              | mintty                     | Noctty default                                    |
 | ----------------- | -------------------------- | ------------------------------------------------- |
-| Copy              | `Ctrl+Insert`              | `Ctrl+Shift+C`                                    |
-| Paste             | `Shift+Insert`             | `Ctrl+Shift+V`                                    |
+| Copy              | `Ctrl+Insert`              | `Ctrl+Shift+C`, and `Ctrl+Insert` works too       |
+| Paste             | `Shift+Insert`             | `Ctrl+Shift+V`, and `Shift+Insert` works too      |
 | New window or tab | `Alt+F2` opens a window    | `Ctrl+Shift+T` opens a tab                        |
 | Split             | not supported              | `Ctrl+Shift+\` right, `Ctrl+Shift+E` down         |
 | Search            | `Alt+F3`                   | `Ctrl+Shift+F`                                    |

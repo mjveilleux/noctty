@@ -6838,12 +6838,17 @@ pub const Keybinds = struct {
                 .{ .select_all = {} },
             );
 
-            // Selection clipboard paste
-            try self.set.put(
-                alloc,
-                .{ .key = .{ .physical = .insert }, .mods = .{ .shift = true } },
-                .{ .paste_from_selection = {} },
-            );
+            // Selection clipboard paste. Windows has no selection clipboard, so
+            // there `shift+insert` stays the clipboard paste added above; a
+            // later `paste_from_selection` here replaced it and, doing
+            // nothing, swallowed the key.
+            if (comptime builtin.target.os.tag != .windows) {
+                try self.set.put(
+                    alloc,
+                    .{ .key = .{ .physical = .insert }, .mods = .{ .shift = true } },
+                    .{ .paste_from_selection = {} },
+                );
+            }
         }
         {
             // On macOS we default to super but everywhere else
@@ -6914,12 +6919,23 @@ pub const Keybinds = struct {
             );
         }
 
-        // Toggle fullscreen
-        try self.set.put(
-            alloc,
-            .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{}) },
-            .{ .toggle_fullscreen = {} },
-        );
+        // Toggle fullscreen. F11 is the Windows convention (every browser,
+        // Windows Terminal). Ctrl+Enter and Alt+Enter stay unbound there: a
+        // program tells Ctrl+Enter from Enter now (Win32 input mode records),
+        // and Alt+Enter is a TUI chord.
+        if (comptime builtin.target.os.tag == .windows) {
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .f11 } },
+                .{ .toggle_fullscreen = {} },
+            );
+        } else {
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{}) },
+                .{ .toggle_fullscreen = {} },
+            );
+        }
 
         // Toggle zoom a split
         try self.set.put(
@@ -6942,20 +6958,55 @@ pub const Keybinds = struct {
             .toggle_quick_select,
         );
 
-        // Keyboard focus-region cycle. F6 / Shift+F6 is the Windows
-        // convention for moving focus between the panes of a window, and
-        // it is the only keyboard path into the tab strip, the docked
-        // search controls, and the host banner.
+        // Keyboard focus-region cycle. It is the only keyboard path into the
+        // tab strip, the docked search controls, and the host banner. Ctrl+F6
+        // / Ctrl+Shift+F6 is the Windows chord for moving between the windows
+        // of an application; a bare F6 belongs to the program in the pane
+        // (htop's nice, Midnight Commander's move, vim mappings).
         try self.set.put(
             alloc,
-            .{ .key = .{ .physical = .f6 } },
+            .{ .key = .{ .physical = .f6 }, .mods = .{ .ctrl = true } },
             .{ .cycle_focus_region = .next },
         );
         try self.set.put(
             alloc,
-            .{ .key = .{ .physical = .f6 }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .f6 }, .mods = .{ .ctrl = true, .shift = true } },
             .{ .cycle_focus_region = .previous },
         );
+
+        // Undo and redo, and search navigation, on Windows. All are
+        // performable: with nothing to undo, redo or navigate the chord goes to
+        // the program in the pane (F3 is Midnight Commander's view and htop's
+        // search). Ctrl+Shift+Y is `copy_last_command_output`, so redo takes
+        // the same letter as undo with Alt added.
+        if (comptime builtin.target.os.tag == .windows) {
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .undo = {} },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .alt = true, .shift = true } },
+                .{ .redo = {} },
+                .{ .performable = true },
+            );
+            // F3 does what Enter does in the docked search bar: the next match
+            // down. Shift+F3 does what Shift+Enter does.
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .f3 } },
+                .{ .navigate_search = .previous },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .f3 }, .mods = .{ .shift = true } },
+                .{ .navigate_search = .next },
+                .{ .performable = true },
+            );
+        }
 
         // Copy mode. The named table is intentionally user-customizable, but
         // its defaults consume every otherwise-unbound key so modal input can
@@ -8276,6 +8327,76 @@ pub const Keybinds = struct {
         try testing.expect(keybinds.set.bindings.count() > 0);
     }
 };
+
+test "default Windows keybinds: clipboard, focus cycle, fullscreen, undo and search" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+    const set = &cfg.keybind.set;
+
+    const Binding = inputpkg.Binding;
+    const Case = struct {
+        trigger: Binding.Trigger,
+        action: Binding.Action,
+        performable: bool = false,
+    };
+    const cases = [_]Case{
+        // Shift+Insert pastes the clipboard. A later `paste_from_selection`
+        // on the same chord replaced it and, doing nothing on Windows,
+        // swallowed the key.
+        .{ .trigger = .{ .key = .{ .physical = .insert }, .mods = .{ .shift = true } }, .action = .{ .paste_from_clipboard = {} } },
+        .{ .trigger = .{ .key = .{ .physical = .insert }, .mods = .{ .ctrl = true } }, .action = .{ .copy_to_clipboard = .mixed } },
+        // The focus-region cycle left F6 for Ctrl+F6, which gives a bare F6
+        // back to htop, Midnight Commander and vim.
+        .{ .trigger = .{ .key = .{ .physical = .f6 }, .mods = .{ .ctrl = true } }, .action = .{ .cycle_focus_region = .next } },
+        .{ .trigger = .{ .key = .{ .physical = .f6 }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .cycle_focus_region = .previous } },
+        .{ .trigger = .{ .key = .{ .physical = .f11 } }, .action = .{ .toggle_fullscreen = {} } },
+        .{ .trigger = .{ .key = .{ .physical = .enter }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .toggle_split_zoom = {} } },
+        // Performable: with nothing to undo, redo or step through, the chord
+        // goes on to the program in the pane.
+        .{ .trigger = .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .undo = {} }, .performable = true },
+        .{ .trigger = .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .alt = true, .shift = true } }, .action = .{ .redo = {} }, .performable = true },
+        .{ .trigger = .{ .key = .{ .physical = .f3 } }, .action = .{ .navigate_search = .previous }, .performable = true },
+        .{ .trigger = .{ .key = .{ .physical = .f3 }, .mods = .{ .shift = true } }, .action = .{ .navigate_search = .next }, .performable = true },
+        // Ctrl+Shift+Y was already taken, so redo could not have it.
+        .{ .trigger = .{ .key = .{ .unicode = 'y' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .{ .copy_last_command_output = {} } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("default binding: {f}\n", .{case.trigger});
+        const entry = set.get(case.trigger) orelse return error.DefaultBindingMissing;
+        const leaf = switch (entry.value_ptr.*) {
+            .leaf => |leaf| leaf,
+            else => return error.DefaultBindingNotALeaf,
+        };
+        try testing.expectEqualDeep(case.action, leaf.action);
+        try testing.expectEqual(case.performable, leaf.flags.performable);
+    }
+
+    // Left to the program in the pane: a bare F6, Ctrl+Enter, Alt+Enter, and
+    // the shell's own Ctrl+Z, Ctrl+Y and Ctrl+R.
+    const unbound = [_]Binding.Trigger{
+        .{ .key = .{ .physical = .f6 } },
+        .{ .key = .{ .physical = .f6 }, .mods = .{ .shift = true } },
+        .{ .key = .{ .physical = .enter }, .mods = .{ .ctrl = true } },
+        .{ .key = .{ .physical = .enter }, .mods = .{ .alt = true } },
+        .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true } },
+        .{ .key = .{ .unicode = 'y' }, .mods = .{ .ctrl = true } },
+        .{ .key = .{ .unicode = 'r' }, .mods = .{ .ctrl = true, .shift = true } },
+    };
+    for (unbound) |trigger| {
+        errdefer std.debug.print("bound by default: {f}\n", .{trigger});
+        try testing.expect(set.get(trigger) == null);
+    }
+
+    // Windows has no selection clipboard, so nothing may default to pasting it.
+    var it = set.bindings.iterator();
+    while (it.next()) |entry| switch (entry.value_ptr.*) {
+        .leaf => |leaf| try testing.expect(leaf.action != .paste_from_selection),
+        else => {},
+    };
+}
 
 /// See "font-codepoint-map" for documentation.
 pub const RepeatableCodepointMap = struct {

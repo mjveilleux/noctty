@@ -289,6 +289,31 @@ pub fn dockedSearchArrowDirection(vk: WPARAM) ?input.Binding.Action.NavigateSear
     };
 }
 
+/// The banner for the last tab of a window being closed. It names the key bound
+/// to `undo` (the first one found, in the way a hint is written: `Ctrl+Shift+Z`)
+/// and falls back to a hint without a key when `undo` is unbound.
+pub fn tabClosedMessage(set: *const input.Binding.Set, buf: []u8) []const u8 {
+    const fallback = "Tab closed. Use undo to restore it.";
+    var it = set.bindings.iterator();
+    const trigger = while (it.next()) |entry| {
+        switch (entry.value_ptr.*) {
+            .leaf => |leaf| if (leaf.action == .undo) break entry.key_ptr.*,
+            else => {},
+        }
+    } else return fallback;
+
+    var writer: std.Io.Writer = .fixed(buf);
+    writer.writeAll("Tab closed. Press ") catch return fallback;
+    const key_start = writer.end;
+    writer.print("{f}", .{trigger}) catch return fallback;
+    // `Trigger.format` writes the config spelling, `ctrl+shift+z`.
+    for (buf[key_start..writer.end], key_start..) |*byte, i| {
+        if (i == key_start or buf[i - 1] == '+') byte.* = std.ascii.toUpper(byte.*);
+    }
+    writer.writeAll(" to undo.") catch return fallback;
+    return writer.buffered();
+}
+
 fn searchDirectionFromWheelDelta(delta: i16) input.Binding.Action.NavigateSearch {
     return if (delta > 0)
         .next
@@ -5547,3 +5572,59 @@ test "win32 commandPaletteBannerText suggests tab overview action" {
 }
 
 // End of labels declarations.
+
+test "tabClosedMessage names the key bound to undo" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [96]u8 = undefined;
+
+    var set: input.Binding.Set = .{};
+    try std.testing.expectEqualStrings(
+        "Tab closed. Use undo to restore it.",
+        tabClosedMessage(&set, &buf),
+    );
+
+    try set.put(arena.allocator(), .{ .key = .{ .unicode = 't' }, .mods = .{ .ctrl = true } }, .{ .new_tab = {} });
+    try std.testing.expectEqualStrings(
+        "Tab closed. Use undo to restore it.",
+        tabClosedMessage(&set, &buf),
+    );
+
+    try set.putFlags(
+        arena.allocator(),
+        .{ .key = .{ .unicode = 'z' }, .mods = .{ .ctrl = true, .shift = true } },
+        .{ .undo = {} },
+        .{ .performable = true },
+    );
+    try std.testing.expectEqualStrings(
+        "Tab closed. Press Ctrl+Shift+Z to undo.",
+        tabClosedMessage(&set, &buf),
+    );
+
+    // A physical key, and a buffer too small for the hint.
+    var other: input.Binding.Set = .{};
+    try other.put(arena.allocator(), .{ .key = .{ .physical = .f9 }, .mods = .{ .alt = true } }, .{ .undo = {} });
+    try std.testing.expectEqualStrings(
+        "Tab closed. Press Alt+F9 to undo.",
+        tabClosedMessage(&other, &buf),
+    );
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Tab closed. Use undo to restore it.",
+        tabClosedMessage(&other, &tiny),
+    );
+}
+
+test "default F3 and Shift+F3 step through the search the way Enter and Shift+Enter do in the docked search bar" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var cfg = try @import("../../config.zig").Config.default(std.testing.allocator);
+    defer cfg.deinit();
+    const set = &cfg.keybind.set;
+
+    const f3 = set.get(.{ .key = .{ .physical = .f3 } }) orelse return error.F3Unbound;
+    const shift_f3 = set.get(.{ .key = .{ .physical = .f3 }, .mods = .{ .shift = true } }) orelse
+        return error.ShiftF3Unbound;
+    try std.testing.expectEqual(dockedSearchEnterDirection(false), f3.value_ptr.leaf.action.navigate_search);
+    try std.testing.expectEqual(dockedSearchEnterDirection(true), shift_f3.value_ptr.leaf.action.navigate_search);
+}

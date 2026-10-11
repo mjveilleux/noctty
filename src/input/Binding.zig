@@ -647,9 +647,10 @@ pub const Action = union(enum) {
     /// terminal pane, the tab strip, the docked search controls, and the
     /// host banner. Regions that are not on screen are skipped.
     ///
-    /// Valid arguments are `next` and `previous`. This is the Windows F6
-    /// convention, and it is the only way to reach the window chrome
-    /// without a mouse. Escape returns focus to the terminal.
+    /// Valid arguments are `next` and `previous`, bound by default to
+    /// Ctrl+F6 and Ctrl+Shift+F6 (a bare F6 belongs to the program in the
+    /// pane). It is the only way to reach the window chrome without a
+    /// mouse. Escape returns focus to the terminal.
     ///
     /// This is only implemented on Windows.
     cycle_focus_region: FocusRegion,

@@ -104,22 +104,33 @@ docs, including the keybind grammar.
 Defaults are Ctrl chords, mostly the same as Ghostty's non-macOS defaults.
 Pane focus on `Alt+Arrow` is Windows-specific.
 
-| Action                   | Binding                       |
-| ------------------------ | ----------------------------- |
-| Copy                     | `Ctrl+Shift+C`                |
-| Paste                    | `Ctrl+Shift+V`                |
-| New tab                  | `Ctrl+Shift+T`                |
-| Close tab                | `Ctrl+Shift+W`                |
-| Next / previous tab      | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
-| Split pane right         | `Ctrl+Shift+\`                |
-| Split pane down          | `Ctrl+Shift+E`                |
-| Move between panes       | `Alt+Arrow`                   |
-| Command palette          | `Ctrl+Shift+P`                |
-| Quick select             | `Ctrl+Shift+Space`            |
-| Copy mode                | `Ctrl+Shift+X`                |
-| Start search             | `Ctrl+Shift+F`                |
-| Increase / decrease font | `Ctrl+=` / `Ctrl+-`           |
-| Reload config            | `Ctrl+Shift+,`                |
+| Action                      | Binding                             |
+| --------------------------- | ----------------------------------- |
+| Copy                        | `Ctrl+Shift+C` or `Ctrl+Insert`     |
+| Paste                       | `Ctrl+Shift+V` or `Shift+Insert`    |
+| New tab                     | `Ctrl+Shift+T`                      |
+| Close tab                   | `Ctrl+Shift+W`                      |
+| Undo / redo                 | `Ctrl+Shift+Z` / `Ctrl+Alt+Shift+Z` |
+| Next / previous tab         | `Ctrl+Tab` / `Ctrl+Shift+Tab`       |
+| Split pane right            | `Ctrl+Shift+\`                      |
+| Split pane down             | `Ctrl+Shift+E`                      |
+| Move between panes          | `Alt+Arrow`                         |
+| Move focus to the tab strip | `Ctrl+F6` / `Ctrl+Shift+F6`         |
+| Command palette             | `Ctrl+Shift+P`                      |
+| Quick select                | `Ctrl+Shift+Space`                  |
+| Copy mode                   | `Ctrl+Shift+X`                      |
+| Start search                | `Ctrl+Shift+F`                      |
+| Next / previous match       | `F3` / `Shift+F3`                   |
+| Full screen                 | `F11`                               |
+| Increase / decrease font    | `Ctrl+=` / `Ctrl+-`                 |
+| Reload config               | `Ctrl+Shift+,`                      |
+
+`F6`, `Ctrl+Enter` and `Alt+Enter` are not bound, so they go to the program in
+the pane (`F6` is htop's and Midnight Commander's). `F3`, `Shift+F3` and the
+undo chords act only when there is a search to step through or something to
+undo (a closed tab or split, `clear_screen`, `reset`); otherwise they reach
+the program too. `Ctrl+F6` moves keyboard focus between the terminal, the tab
+strip, the docked search and the host banner; `Esc` returns to the terminal.
 
 `noctty +list-keybinds` prints the full list. `Ctrl+Shift+O` also splits
 right; the docs use `Ctrl+Shift+\` because Narrator can reserve O-based
