@@ -1646,6 +1646,12 @@ pub const SettingsWindow = struct {
     close_after_save: bool = false,
     close_posted: bool = false,
     close_notified: bool = false,
+    /// The app's quit waits on the close prompt: set by
+    /// `holdQuitForUnsavedChanges`, cleared by Keep editing or a failed
+    /// save, and taken by the app's `onClosed` once Save or Discard closed
+    /// the window. Outlives the window's state reset in WM_NCDESTROY,
+    /// which runs before `onClosed`.
+    quit_after_close: bool = false,
     close_prior_focus: ?HWND = null,
     validation_control: ?HWND = null,
     owned_validation_control: ?HWND = null,
@@ -1825,6 +1831,7 @@ pub const SettingsWindow = struct {
         self.combo_auto_update = null;
         self.combo_auto_update_channel = null;
         self.resetClosePromptState();
+        self.quit_after_close = false;
         self.clearPending();
     }
 
@@ -4175,9 +4182,30 @@ pub const SettingsWindow = struct {
         if (self.btn_close_keep_editing) |button| _ = sys.SetFocus(button);
     }
 
+    /// The app's quit asks here first. With unsaved changes, raise the window
+    /// with its close prompt and hold the quit: Save or Discard closes the
+    /// window and `onClosed` resumes the quit (`takeQuitAfterClose`), while
+    /// Keep editing, or a save that fails, drops it. Returns whether the
+    /// quit has to wait.
+    pub fn holdQuitForUnsavedChanges(self: *SettingsWindow) bool {
+        const hwnd = self.hwnd orelse return false;
+        if (self.close_posted or !self.hasPendingChanges()) return false;
+        if (sys.IsIconic(hwnd) != 0) _ = sys.ShowWindow(hwnd, SW_RESTORE);
+        _ = SetForegroundWindow(hwnd);
+        self.quit_after_close = true;
+        self.showClosePrompt();
+        return true;
+    }
+
+    pub fn takeQuitAfterClose(self: *SettingsWindow) bool {
+        defer self.quit_after_close = false;
+        return self.quit_after_close;
+    }
+
     fn cancelClosePrompt(self: *SettingsWindow) void {
         if (!closePromptCanCancel(self.close_prompt_visible, self.close_posted)) return;
         const prior_focus = self.close_prior_focus;
+        self.quit_after_close = false;
         self.close_prompt_visible = false;
         self.close_after_save = false;
         self.close_prior_focus = null;

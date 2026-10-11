@@ -6714,10 +6714,7 @@ pub const App = struct {
     ) !bool {
         switch (action) {
             .quit => {
-                self.stopQuitTimer();
-                self.running = false;
-                self.destroyAllWindows();
-                if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+                self.requestQuit(self.undoRedoSurfaceForTarget(target));
                 return true;
             },
 
@@ -6909,10 +6906,8 @@ pub const App = struct {
             },
 
             .close_all_windows => {
-                self.stopQuitTimer();
-                self.running = false;
-                self.destroyAllWindows();
-                if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+                // Closing every window quits, as `quit` does.
+                self.requestQuit(self.undoRedoSurfaceForTarget(target));
                 return true;
             },
 
@@ -9607,41 +9602,54 @@ pub const App = struct {
                 return true;
             },
 
-            .other => {
-                if (host.tabs.items.len <= 1) return false;
-                if (!host.tryClearStructuralHistory(.normal)) return error.HistoryDisposalDeferred;
-                found.tab.clearRedoHistory();
-                var closed = false;
-                var i = host.tabs.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (i == current_idx) continue;
-                    host.tabs.items[i].clearRedoHistory();
-                    var it = host.tabs.items[i].tree.iterator();
-                    while (it.next()) |entry| entry.view.close(false);
-                    closed = true;
-                }
-                if (closed) self.activateSurface(current);
-                return closed;
-            },
-
-            .right => {
-                if (current_idx + 1 >= host.tabs.items.len) return false;
-                if (!host.tryClearStructuralHistory(.normal)) return error.HistoryDisposalDeferred;
-                found.tab.clearRedoHistory();
-                var closed = false;
-                var i = host.tabs.items.len;
-                while (i > current_idx + 1) {
-                    i -= 1;
-                    host.tabs.items[i].clearRedoHistory();
-                    var it = host.tabs.items[i].tree.iterator();
-                    while (it.next()) |entry| entry.view.close(false);
-                    closed = true;
-                }
-                if (closed) self.activateSurface(current);
-                return closed;
+            // Not undoable, unlike `.this`: ask first when a terminal in
+            // the closing tabs would lose a running process.
+            inline .other, .right => |beside| {
+                const tabs = host.tabs.items;
+                if (beside == .other and tabs.len <= 1) return false;
+                if (beside == .right and current_idx + 1 >= tabs.len) return false;
+                const count = if (beside == .other)
+                    tabsCloseConfirmCount(tabs[0..current_idx]) + tabsCloseConfirmCount(tabs[current_idx + 1 ..])
+                else
+                    tabsCloseConfirmCount(tabs[current_idx + 1 ..]);
+                if (count == 0) return try self.closeTabsBeside(current, beside);
+                if (beside == .other)
+                    host.askBeforeClosing(.other_tabs, count, &closeOtherTabsConfirmAccept, current)
+                else
+                    host.askBeforeClosing(.right_tabs, count, &closeRightTabsConfirmAccept, current);
+                return true;
             },
         }
+    }
+
+    /// Close every tab beside `current`'s (`.other`), or the tabs to its
+    /// right, without asking. Not undoable: the history goes first. The
+    /// panes are listed before any of them closes, because each close
+    /// replaces or removes its tab's split tree.
+    fn closeTabsBeside(self: *App, current: *Surface, comptime beside: apprt.action.CloseTabMode) !bool {
+        comptime std.debug.assert(beside != .this);
+        const found = self.findTabForSurface(current) orelse return false;
+        const host = found.host;
+        const keep = found.index;
+        const alloc = self.core_app.alloc;
+        var surfaces: std.ArrayListUnmanaged(*Surface) = .empty;
+        defer surfaces.deinit(alloc);
+        var i = host.tabs.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (i == keep or (beside == .right and i < keep)) continue;
+            var it = host.tabs.items[i].tree.iterator();
+            while (it.next()) |entry| try surfaces.append(alloc, entry.view);
+        }
+        if (surfaces.items.len == 0) return false;
+        if (!host.tryClearStructuralHistory(.normal)) return error.HistoryDisposalDeferred;
+        for (host.tabs.items, 0..) |*tab, index| {
+            if (beside == .right and index < keep) continue;
+            tab.clearRedoHistory();
+        }
+        for (surfaces.items) |surface| surface.close(false);
+        self.activateSurface(current);
+        return true;
     }
 
     fn gotoTab(self: *App, target: apprt.Target, goto: apprt.action.GotoTab) !bool {
@@ -9917,6 +9925,40 @@ pub const App = struct {
         defer self.core_app.alloc.free(osk_w);
         const result = sys.ShellExecuteW(null, shell_open, osk_w.ptr, null, null, c.SW_SHOW);
         if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
+    }
+
+    /// `quit` and `close_all_windows`. Unsaved Settings edits ask first, in
+    /// the Settings window, which resumes the quit once they are saved or
+    /// discarded (`settingsOnClosedThunk`). Then terminals that
+    /// `confirm-close-surface` asks about get one prompt, on `near`'s window
+    /// when it has one. Closed tabs kept for undo are not asked about.
+    fn requestQuit(self: *App, near: ?*Surface) void {
+        if (self.settings_window.holdQuitForUnsavedChanges()) return;
+        if (!self.session_ending) {
+            var count: usize = 0;
+            var prompt_host: ?*Host = null;
+            for (self.hosts.items) |host| {
+                const host_count = tabsCloseConfirmCount(host.tabs.items);
+                if (host_count == 0) continue;
+                count += host_count;
+                if (prompt_host == null) prompt_host = host;
+            }
+            if (near) |surface| if (surface.host) |host| if (host.tabs.items.len > 0) {
+                prompt_host = host;
+            };
+            if (prompt_host) |host| if (count > 0) {
+                host.askBeforeClosing(.app, count, &appQuitConfirmAccept, self);
+                return;
+            };
+        }
+        self.quitConfirmed();
+    }
+
+    fn quitConfirmed(self: *App) void {
+        self.stopQuitTimer();
+        self.running = false;
+        self.destroyAllWindows();
+        if (self.windows.items.len == 0) sys.PostQuitMessage(0);
     }
 
     fn destroyAllWindows(self: *App) void {
@@ -11929,6 +11971,63 @@ const ConfirmPrompt = struct {
     /// the close-surface prompt.
     contents: ?[]const u8 = null,
 };
+
+/// What a close that ends several terminals at once is closing. One pane
+/// keeps its own prompt in `Surface.close`.
+const CloseScope = enum { window, other_tabs, right_tabs, app };
+
+/// The prompt for a close that would end `count` (at least 1) terminals
+/// that `confirm-close-surface` asks about. The body may live in `body_buf`.
+fn closeScopePrompt(scope: CloseScope, count: usize, body_buf: *[256]u8) ConfirmPrompt {
+    switch (scope) {
+        inline else => |comptime_scope| {
+            const text: struct { title: []const u8, accept: []const u8, one: []const u8, many: []const u8 } = comptime switch (comptime_scope) {
+                .window => .{
+                    .title = "Close this window?",
+                    .accept = "Close",
+                    .one = "A process is still running in this window. Closing the window will terminate it.",
+                    .many = "Processes are still running in {d} terminals in this window. Closing the window will terminate them.",
+                },
+                .other_tabs => .{
+                    .title = "Close the other tabs?",
+                    .accept = "Close tabs",
+                    .one = "A process is still running in another tab. Closing the other tabs will terminate it.",
+                    .many = "Processes are still running in {d} terminals in the other tabs. Closing those tabs will terminate them.",
+                },
+                .right_tabs => .{
+                    .title = "Close the tabs to the right?",
+                    .accept = "Close tabs",
+                    .one = "A process is still running in a tab to the right. Closing those tabs will terminate it.",
+                    .many = "Processes are still running in {d} terminals in the tabs to the right. Closing those tabs will terminate them.",
+                },
+                .app => .{
+                    .title = "Quit noctty?",
+                    .accept = "Quit",
+                    .one = "A process is still running. Quitting noctty will terminate it.",
+                    .many = "Processes are still running in {d} terminals. Quitting noctty will terminate them.",
+                },
+            };
+            return .{
+                .title = text.title,
+                .body = if (count <= 1) text.one else std.fmt.bufPrint(body_buf, text.many, .{count}) catch text.one,
+                .accept_label = text.accept,
+                .cancel_label = "Cancel",
+            };
+        },
+    }
+}
+
+/// How many panes in `tabs` `confirm-close-surface` asks about.
+fn tabsCloseConfirmCount(tabs: []Tab) usize {
+    var count: usize = 0;
+    for (tabs) |*tab| {
+        var it = tab.tree.iterator();
+        while (it.next()) |entry| {
+            if (entry.view.needsCloseConfirm()) count += 1;
+        }
+    }
+    return count;
+}
 
 /// Payload for a non-modal confirm overlay. The callbacks receive the
 /// `userdata` pointer passed at construction time so the issuer can
@@ -14817,6 +14916,9 @@ const Host = struct {
         self.destroyChildControls();
 
         if (self.banner_text) |value| self.app.core_app.alloc.free(value);
+        // A prompt still open when its window goes, such as a window-close
+        // prompt whose last terminal exited meanwhile.
+        if (self.confirm_payload) |*payload| payload.deinit(self.app.core_app.alloc);
         if (self.overlay_completion_seed) |value| self.app.core_app.alloc.free(value);
         if (self.overlay_completion_value) |value| self.app.core_app.alloc.free(value);
         if (self.cached_overlay_edit) |value| self.app.core_app.alloc.free(value);
@@ -19578,7 +19680,50 @@ const Host = struct {
         return rect;
     }
 
+    /// WM_CLOSE (the caption button, Alt+F4, the taskbar) and
+    /// `close_window`. When a terminal in the window would lose a running
+    /// process (`confirm-close-surface`), ask once for the whole window;
+    /// its Close runs `closeConfirmed`. A sign-out never asks.
     fn close(self: *Host) void {
+        const count = tabsCloseConfirmCount(self.tabs.items);
+        if (count == 0 or self.app.session_ending) return self.closeConfirmed();
+        self.askBeforeClosing(.window, count, &hostCloseConfirmAccept, self);
+    }
+
+    /// One prompt for a close that ends `count` terminals which
+    /// `confirm-close-surface` asks about. The window comes up first, so a
+    /// close from the taskbar or a quit never waits on a prompt nobody can
+    /// see, and asking again keeps the prompt already open. If the prompt
+    /// cannot open, nothing closes, as in `Surface.close`: closing anyway
+    /// would defeat the setting, and the user can retry.
+    fn askBeforeClosing(
+        self: *Host,
+        scope: CloseScope,
+        count: usize,
+        on_accept: *const fn (userdata: ?*anyopaque) void,
+        userdata: *anyopaque,
+    ) void {
+        self.presentForPrompt();
+        if (self.confirm_payload) |payload| {
+            if (payload.on_accept == on_accept and payload.userdata == userdata) return;
+        }
+        var body: [256]u8 = undefined;
+        self.showConfirm(closeScopePrompt(scope, count, &body), on_accept, null, userdata) catch |err| {
+            log.warn("close confirm unavailable err={}; declining close to honour confirm-close-surface", .{err});
+        };
+    }
+
+    /// Restore and raise the window for a prompt unless it is already the
+    /// foreground window.
+    fn presentForPrompt(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        if (sys.GetForegroundWindow() == hwnd and sys.IsIconic(hwnd) == 0) return;
+        const surface = self.activeSurface() orelse return;
+        self.app.activateSurface(surface);
+    }
+
+    /// Close every terminal in the window without asking.
+    fn closeConfirmed(self: *Host) void {
         const alloc = self.app.core_app.alloc;
         const fallback_hwnd = self.hwnd;
         var surfaces: std.ArrayListUnmanaged(*Surface) = .empty;
@@ -24333,9 +24478,10 @@ fn settingsOnClosedThunk(ctx: *anyopaque) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const restore_id = app.settings_restore_surface_id;
     app.settings_restore_surface_id = null;
-    if (settingsRestoreSurface(app, restore_id)) |surface| {
-        app.activateSurface(surface);
-    }
+    const restored = settingsRestoreSurface(app, restore_id);
+    if (restored) |surface| app.activateSurface(surface);
+    // Saved or discarded from the prompt a quit raised: carry on quitting.
+    if (app.settings_window.takeQuitAfterClose()) return app.requestQuit(restored);
     // Mirrors the kick after the last terminal window closes; the
     // quit timer observes `hasLiveUiWindows()` so this is a no-op
     // when any terminal HWND is still alive.
@@ -24457,6 +24603,39 @@ fn surfaceConfirmCloseAccept(userdata: ?*anyopaque) void {
     const ud = userdata orelse return;
     const surface: *Surface = @ptrCast(@alignCast(ud));
     _ = surface.requestClose();
+}
+
+/// Close for the window-close prompt. `userdata` is the Host that shows
+/// the prompt, so it is alive whenever the prompt can be answered.
+fn hostCloseConfirmAccept(userdata: ?*anyopaque) void {
+    const host: *Host = @ptrCast(@alignCast(userdata orelse return));
+    host.closeConfirmed();
+}
+
+/// Quit for the quit prompt. `userdata` is the App, which outlives every
+/// window the quit destroys, including the one showing the prompt.
+fn appQuitConfirmAccept(userdata: ?*anyopaque) void {
+    const app: *App = @ptrCast(@alignCast(userdata orelse return));
+    app.quitConfirmed();
+}
+
+/// Close tabs for the other-tabs prompt. `userdata` is the Surface the
+/// tabs are kept beside: its destruction cancels the prompt
+/// (`cancelConfirmIfOwnedBy`), and the tabs are found again here because
+/// they may have changed while the prompt was open.
+fn closeOtherTabsConfirmAccept(userdata: ?*anyopaque) void {
+    const surface: *Surface = @ptrCast(@alignCast(userdata orelse return));
+    _ = surface.app.closeTabsBeside(surface, .other) catch |err| {
+        log.warn("close other tabs after confirm failed err={}", .{err});
+    };
+}
+
+/// Close tabs for the tabs-to-the-right prompt; see `closeOtherTabsConfirmAccept`.
+fn closeRightTabsConfirmAccept(userdata: ?*anyopaque) void {
+    const surface: *Surface = @ptrCast(@alignCast(userdata orelse return));
+    _ = surface.app.closeTabsBeside(surface, .right) catch |err| {
+        log.warn("close tabs to the right after confirm failed err={}", .{err});
+    };
 }
 
 /// Accept callback for a deferred paste confirm. Ownership of the
@@ -30325,6 +30504,14 @@ pub const Surface = struct {
         }
         const mutable: *Surface = @constCast(self);
         _ = mutable.requestClose();
+    }
+
+    /// Core's `confirm-close-surface` answer for this pane (a running
+    /// process, `always`, or read-only mode), for a close that ends more
+    /// than this pane. A pane whose core is not up has no process to lose.
+    fn needsCloseConfirm(self: *Surface) bool {
+        if (!self.core_initialized) return false;
+        return self.core_surface.needsConfirmQuit();
     }
 
     fn requestClose(self: *Surface) bool {
