@@ -1585,7 +1585,7 @@ $settingsSourcePins = @(
         Description = 'settings clipped-control traversal uses the named count'
     },
     @{
-        Pattern = '(?s)fn syncClosePromptText\(self: \*SettingsWindow.*?setWindowTextUtf8\(text, closePromptText\(self\.save_in_flight\)\).*?fn closePromptText\(save_in_flight: bool\) \[\]const u8.*?fn closePromptMeasuredHeight\(self: \*SettingsWindow.*?utf8ToW\(&text_w, closePromptText\(self\.save_in_flight\)\)'
+        Pattern = '(?s)fn syncClosePromptText\(self: \*SettingsWindow.*?setWindowTextUtf8\(text, closePromptText\(self\.save_in_flight, self\.quit_after_close\)\).*?fn closePromptText\(save_in_flight: bool, quitting: bool\) \[\]const u8.*?fn closePromptMeasuredHeight\(self: \*SettingsWindow.*?utf8ToW\(&text_w, closePromptText\(self\.save_in_flight, self\.quit_after_close\)\)'
         Description = 'close prompt display and measurement share closePromptText'
     },
     @{
