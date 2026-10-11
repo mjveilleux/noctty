@@ -2520,6 +2520,11 @@ keybind: Keybinds = .{},
 /// any confirmation. This can also be set to `always`, which will always
 /// confirm closing a surface, even if shell integration says a process isn't
 /// running.
+///
+/// Closing a window, quitting, `close_all_windows` and `close_tab:other` or
+/// `close_tab:right` ask once for all the surfaces they would close.
+/// `close_tab:this` does not ask, because the closed tab can be restored with
+/// `undo`.
 @"confirm-close-surface": ConfirmCloseSurface = .true,
 
 /// Whether or not to quit after the last surface is closed.
