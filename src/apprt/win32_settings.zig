@@ -1498,6 +1498,13 @@ pub const AppHandle = struct {
     /// Optional conflict notification. The UI model retains the draft until
     /// `resolveConflict` is called with keep-mine or use-disk.
     notifyConflict: ?*const fn (ctx: *anyopaque, field: SettingField) void = null,
+    /// Optional. Asked before a save writes anything: the file may have been
+    /// edited since this window last read it, with no reload to say so.
+    /// Returns true when it found an edit to a setting that is also being
+    /// edited here, after applying the file as a reload does, so that
+    /// `externalConfigChanged` has flagged what overlaps. A save that wrote
+    /// over such an edit would lose it without a word.
+    reconcileDisk: ?*const fn (ctx: *anyopaque, pending: *const Config, original: *const Config) bool = null,
     /// Optional asynchronous two-phase persistence hook. The receiver must
     /// eventually call `SettingsWindow.completeSave` with the same `apply_id`.
     /// When absent, `saveAndReload` remains the synchronous compatibility path.
@@ -4094,6 +4101,15 @@ pub const SettingsWindow = struct {
             self.surfaceNextValidation(false);
             return;
         }
+        // The check may merge a changed file into this window, so it runs on
+        // the window's own configs and nothing below uses a copy made before it.
+        if (self.handle.reconcileDisk) |reconcile| {
+            if (self.pending) |*draft| if (self.original) |*baseline| if (reconcile(self.handle.ctx, draft, baseline)) {
+                if (self.conflictCount() != 0) self.surfaceNextValidation(false) else self.setNote(.changed_on_disk);
+                self.updateSaveEnabled();
+                return;
+            };
+        }
         const p = self.pending orelse return;
         const o = self.original orelse return;
 
@@ -5702,6 +5718,96 @@ test "settings opacity preview is floored while the draft keeps the typed value"
         settings.clearPending();
         try std.testing.expectEqual(case.saved, capture.previews[capture.count - 1]);
     }
+}
+
+test "settings save checks the file for edits first, and a conflict stops it" {
+    const Capture = struct {
+        saved: u32 = 0,
+        asked: u32 = 0,
+        /// What the file now holds for the font size; null means it still
+        /// holds what this session started from.
+        disk_font_size: ?f32 = null,
+        settings: *SettingsWindow = undefined,
+        fn save(ctx: *anyopaque, _: *const Config, _: *const Config) SaveError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.saved += 1;
+            // Keep the draft, as a failed write does, so the test need not
+            // fake a config reload.
+            return error.SerializeFailed;
+        }
+        fn reconcile(ctx: *anyopaque, _: *const Config, _: *const Config) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.asked += 1;
+            const size = self.disk_font_size orelse return false;
+            // What the app does on finding a changed file: apply it as a reload.
+            var disk = Config.default(std.testing.allocator) catch return false;
+            defer disk.deinit();
+            disk.@"font-size" = size;
+            self.settings.externalConfigChanged(&disk, 100);
+            return true;
+        }
+    };
+    const edit = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 1, 1, null, null, null, null) orelse return error.Unexpected;
+    defer _ = sys.DestroyWindow(edit);
+    const current = try Config.default(std.testing.allocator);
+    var capture: Capture = .{};
+    var settings: SettingsWindow = .{
+        .handle = .{ .ctx = &capture, .alloc = std.testing.allocator, .hinstance = undefined, .chromeBg = undefined, .textPrimary = undefined, .openInEditor = undefined, .currentConfig = undefined, .saveAndReload = Capture.save, .notifySuccess = undefined, .onClosed = undefined, .reconcileDisk = Capture.reconcile },
+        .current = current,
+        .original = try current.clone(std.testing.allocator),
+        .pending = try current.clone(std.testing.allocator),
+        .edit_font_size = edit,
+    };
+    capture.settings = &settings;
+    settings.initTransaction();
+    defer settings.clearPending();
+
+    // The draft: font size 14, from a session that started at the default 12.
+    _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("14"));
+    settings.syncFontSizeFromEdit();
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+
+    // The file is as the session left it: the save goes ahead.
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 1), capture.asked);
+    try std.testing.expectEqual(@as(u32, 1), capture.saved);
+
+    // The file now says 16 for the setting being edited: nothing is written,
+    // the conflict is shown, and the draft is kept for Keep mine / Use disk.
+    capture.disk_font_size = 16;
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 2), capture.asked);
+    try std.testing.expectEqual(@as(u32, 1), capture.saved);
+    try std.testing.expect(settings.hasConflict(.font_size));
+    try std.testing.expectEqual(@as(usize, 1), settings.conflictCount());
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+
+    // While a conflict is open the save does not even read the file again.
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 2), capture.asked);
+
+    // Keep mine adopts the file's value as the baseline; the next save
+    // writes the draft.
+    capture.disk_font_size = null;
+    settings.resolveConflict(.font_size, .keep_mine);
+    try std.testing.expectEqual(@as(usize, 0), settings.conflictCount());
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 3), capture.asked);
+    try std.testing.expectEqual(@as(u32, 2), capture.saved);
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+}
+
+test "settings without a disk check save as before, and a failed save names an unusable encoding" {
+    try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.SerializeFailed));
+    try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.ReplaceFailed));
+    try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.PathResolveFailed));
+    try std.testing.expectEqual(StatusNote.unsupported_encoding, saveFailureNote(error.UnsupportedEncoding));
+    // The note tells the person what to do, in words, and is held while the
+    // edits it is about are still there.
+    const text = StatusNote.unsupported_encoding.text();
+    try std.testing.expect(std.mem.indexOf(u8, text, "UTF-8") != null);
+    try expectNoInternalSyntax(text);
+    try expectNoInternalSyntax(StatusNote.changed_on_disk.text());
 }
 
 fn stubChromeBg(_: *anyopaque) COLORREF {

@@ -3101,6 +3101,36 @@ fn settingsEditedValueMasked(
     return pending.changed(reloaded, comptime key);
 }
 
+/// Whether the file now says something else, for a setting the draft changes,
+/// than both the value this session started from (`original`) and the draft:
+/// someone else changed what the user is changing. A file that agrees with the
+/// draft lost nothing, and one that agrees with `original` holds only the
+/// user's own edit to come.
+fn settingsDiskEditConflict(
+    original: *const configpkg.Config,
+    pending: *const configpkg.Config,
+    disk: *const configpkg.Config,
+    user_edited: SettingsEditedKeySet,
+) bool {
+    inline for (win32_settings.editable_keys) |key| {
+        if (user_edited.isSet(@intFromEnum(key)) and
+            settingsDiskValueDiffers(original, disk, key) and
+            settingsDiskValueDiffers(pending, disk, key)) return true;
+    }
+    return false;
+}
+
+fn settingsDiskValueDiffers(
+    known: *const configpkg.Config,
+    disk: *const configpkg.Config,
+    comptime key: SettingsConfigKey,
+) bool {
+    // The window keeps a command nobody set as automatic (null); the load
+    // fills in the one it found.
+    if (key == .command and disk._command_defaulted and known.command == null) return false;
+    return known.changed(disk, key);
+}
+
 test "win32 bounded UTF-8 prefix never splits a codepoint" {
     const value = "123\u{1f680}tail";
     try std.testing.expectEqual(@as(usize, 3), utf8PrefixLen(value, 4));
@@ -4036,6 +4066,7 @@ pub const App = struct {
             .configRevision = &settingsConfigRevisionThunk,
             .previewField = &settingsPreviewFieldThunk,
             .notifyConflict = &settingsNotifyConflictThunk,
+            .reconcileDisk = &settingsReconcileDiskThunk,
             .notifySuccess = &settingsNotifySuccessThunk,
             .customUiaProvidersEnabled = &settingsCustomUiaProvidersEnabledThunk,
             .deferUiaDisconnect = &settingsDeferUiaDisconnectThunk,
@@ -10561,54 +10592,10 @@ pub const App = struct {
 
         try persistSettings(alloc, target_path, pending, user_edited);
 
-        // Mirror the `.reload_config` hard-reload path at win32.zig
-        // line ~2106: re-read from disk + push through CoreApp so
-        // every surface's next frame picks up the new values.
-        //
-        // Temporarily restore the startup cwd around `Config.load`.
-        // `loadCliArgs` resolves relative `--config-file` argv entries
-        // via realpath-against-cwd; after `sanitizeCurrentDirectory()`
-        // ran, cwd is typically `%USERPROFILE%`, and a user who
-        // launched with `--config-file=custom.conf` would see the
-        // reload pick up `%USERPROFILE%\custom.conf` instead of the
-        // file we just wrote. Save lands correctly, but the live
-        // config would immediately diverge from disk — "my edits
-        // didn't take effect until restart" is exactly this bug.
-        // Capture the current (sanitized) cwd so we can restore it
-        // after the reload. Leaking a cwd change into the rest of
-        // process lifetime would change where other code resolves
-        // relative paths — for example, a subsequent surface spawn
-        // could inherit the wrong working directory.
-        const cwd_before: ?[]u8 = std.process.getCwdAlloc(alloc) catch null;
-        defer if (cwd_before) |p| alloc.free(p);
-
-        // `defer` (NOT inline restore) for the cwd rollback so BOTH the
-        // happy path AND the `ReloadFailed` error path run it. Earlier
-        // code had `Config.load catch return error.ReloadFailed`
-        // followed by an inline restore; the return short-circuited
-        // the restore, leaving the process pinned to `startup_cwd`
-        // whenever a reload hit a broken config file. Downstream
-        // surface spawns then inherited the wrong cwd until restart.
-        var did_chdir_to_startup: bool = false;
-        if (self.startup_cwd) |cwd| {
-            std.fs.cwd().makePath(cwd) catch {}; // no-op if exists
-            if (std.process.changeCurDir(cwd)) |_| {
-                did_chdir_to_startup = true;
-            } else |err| {
-                std.log.warn("settings save: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
-            }
-        }
-        defer {
-            if (did_chdir_to_startup) {
-                if (cwd_before) |cwd| {
-                    std.process.changeCurDir(cwd) catch |err| {
-                        std.log.warn("settings save: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
-                    };
-                }
-            }
-        }
-
-        var reloaded = configpkg.Config.load(alloc) catch return error.ReloadFailed;
+        // Mirror the `.reload_config` hard-reload path: re-read from disk and
+        // push through CoreApp so every surface's next frame picks up the
+        // new values.
+        var reloaded = self.loadConfigAtStartupCwd() catch return error.ReloadFailed;
         defer reloaded.deinit();
 
         // Post-save validation: detect fields the user GUI-edited
@@ -10633,6 +10620,83 @@ pub const App = struct {
 
         self.core_app.updateConfig(self, &reloaded) catch return error.ReloadFailed;
         if (any_masked) return error.SavedButMasked;
+    }
+
+    /// `Config.load` as the process started.
+    ///
+    /// `loadCliArgs` resolves relative `--config-file` argv entries
+    /// via realpath-against-cwd; after `sanitizeCurrentDirectory()`
+    /// ran, cwd is typically `%USERPROFILE%`, and a user who
+    /// launched with `--config-file=custom.conf` would see the
+    /// reload pick up `%USERPROFILE%\custom.conf` instead of the
+    /// file we just wrote. Save lands correctly, but the live
+    /// config would immediately diverge from disk — "my edits
+    /// didn't take effect until restart" is exactly this bug.
+    /// The sanitized cwd is put back afterwards: leaking a cwd change
+    /// into the rest of process lifetime would change where other code
+    /// resolves relative paths — for example, a subsequent surface spawn
+    /// could inherit the wrong working directory.
+    ///
+    /// The restore is a `defer` (NOT an inline step after the load) so BOTH
+    /// the happy path AND the error path run it. Earlier code had
+    /// `Config.load catch return ...` followed by an inline restore; the
+    /// return short-circuited the restore, leaving the process pinned to
+    /// `startup_cwd` whenever a reload hit a broken config file.
+    fn loadConfigAtStartupCwd(self: *App) !configpkg.Config {
+        const alloc = self.core_app.alloc;
+        const cwd_before: ?[]u8 = std.process.getCwdAlloc(alloc) catch null;
+        defer if (cwd_before) |p| alloc.free(p);
+
+        var did_chdir_to_startup: bool = false;
+        if (self.startup_cwd) |cwd| {
+            std.fs.cwd().makePath(cwd) catch {}; // no-op if exists
+            if (std.process.changeCurDir(cwd)) |_| {
+                did_chdir_to_startup = true;
+            } else |err| {
+                std.log.warn("config load: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
+            }
+        }
+        defer {
+            if (did_chdir_to_startup) {
+                if (cwd_before) |cwd| {
+                    std.process.changeCurDir(cwd) catch |err| {
+                        std.log.warn("config load: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
+                    };
+                }
+            }
+        }
+
+        return configpkg.Config.load(alloc);
+    }
+
+    /// Before a Settings save: has the config file been edited since the
+    /// window last read it, in a setting that is also being edited there? The
+    /// window only learns of an edit through a reload, so a save without one
+    /// wrote its value over the other: the file's line was replaced and the
+    /// edit was gone with no prompt.
+    ///
+    /// The file is read exactly as a reload reads it, and judged by the
+    /// effective values, which is how the window itself decides what is a
+    /// conflict (`externalConfigChanged`); an edit to an included file or to
+    /// another setting is not one. When there is one, the file is applied as
+    /// a reload applies it, which hands the window the conflict to resolve
+    /// (Keep mine or Use disk), and this returns true: nothing is saved.
+    fn settingsReconcileDisk(self: *App, pending: *const configpkg.Config, original: *const configpkg.Config) bool {
+        const user_edited = settingsUserEditedKeys(original, pending);
+        if (user_edited.count() == 0) return false;
+        // A file that cannot be read now is the save's own error to report.
+        var disk = self.loadConfigAtStartupCwd() catch |err| {
+            log.warn("settings save: could not read the config file to check it for edits err={}", .{err});
+            return false;
+        };
+        defer disk.deinit();
+        if (!settingsDiskEditConflict(original, pending, &disk, user_edited)) return false;
+        log.info("settings save: the config file changed on disk under an edited setting; offering the choice", .{});
+        self.core_app.updateConfig(self, &disk) catch |err| {
+            log.warn("settings save: applying the changed config file failed err={}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// The legacy `ShellExecuteW` path. Kept alive for Advanced pane
@@ -24233,6 +24297,14 @@ fn settingsNotifyConflictThunk(ctx: *anyopaque, field: win32_settings.SettingFie
     const app: *App = @ptrCast(@alignCast(ctx));
     app.settings_window.promptConflict(field);
 }
+fn settingsReconcileDiskThunk(
+    ctx: *anyopaque,
+    pending: *const configpkg.Config,
+    original: *const configpkg.Config,
+) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.settingsReconcileDisk(pending, original);
+}
 fn settingsSaveAndReloadThunk(
     ctx: *anyopaque,
     pending: *const configpkg.Config,
@@ -25123,6 +25195,60 @@ test "win32 settings automatic command is not masked by default resolution" {
     try std.testing.expect(!settingsEditedValueMasked(&pending, &reloaded, .command));
     try settingsTestLoadText(&reloaded, "command = direct:cmd.exe\n");
     try std.testing.expect(settingsEditedValueMasked(&pending, &reloaded, .command));
+}
+
+test "win32 settings disk edit is a conflict only for an edited setting the file now says differently" {
+    const alloc = std.testing.allocator;
+    var original = try configpkg.Config.default(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.@"font-size" = 14;
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expect(edited.isSet(@intFromEnum(SettingsConfigKey.@"font-size")));
+    var disk = try original.clone(alloc);
+    defer disk.deinit();
+
+    // The file is as the session found it: only the user's edit is new.
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, edited));
+    // Someone set the same setting to something else.
+    disk.@"font-size" = 16;
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &disk, edited));
+    // ... unless it is the value the user is setting: nothing would be lost.
+    disk.@"font-size" = 14;
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, edited));
+    // An edit to a setting the user is not changing is merged by the save and
+    // applied by its reload, not a conflict.
+    disk.@"font-size" = 12;
+    disk.@"copy-on-select" = .true;
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, edited));
+    // Nothing edited, nothing to lose.
+    try std.testing.expect(!settingsDiskEditConflict(&original, &original, &disk, settingsUserEditedKeys(&original, &original)));
+}
+
+test "win32 settings disk edit does not mistake the resolved default command for an edit" {
+    const alloc = std.testing.allocator;
+    // The window keeps a command nobody set as automatic (null); the load
+    // fills in the shell it found.
+    var original = try configpkg.Config.default(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.command = .{ .shell = "pwsh" };
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expect(edited.isSet(@intFromEnum(SettingsConfigKey.command)));
+
+    var resolved = try original.clone(alloc);
+    defer resolved.deinit();
+    try resolved.resolveWindowsDefaultCommand();
+    try std.testing.expect(resolved.command != null and resolved._command_defaulted);
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &resolved, edited));
+
+    // A command written in the file is another matter.
+    var written = try original.clone(alloc);
+    defer written.deinit();
+    written.command = .{ .shell = "cmd" };
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &written, edited));
 }
 
 test "win32 settings save target stops at the child command boundary" {
@@ -35498,6 +35624,7 @@ const TestSession = struct {
                 .configRevision = &settingsConfigRevisionThunk,
                 .previewField = &settingsPreviewFieldThunk,
                 .notifyConflict = &settingsNotifyConflictThunk,
+                .reconcileDisk = &settingsReconcileDiskThunk,
                 .notifySuccess = &settingsNotifySuccessThunk,
                 .customUiaProvidersEnabled = &settingsCustomUiaProvidersEnabledThunk,
                 .deferUiaDisconnect = &settingsDeferUiaDisconnectThunk,
