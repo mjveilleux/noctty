@@ -156,9 +156,11 @@ pub fn write(alloc: Allocator, target: Target, bytes: []const u8) WriteError!voi
     }
 
     if (target.hard_linked) {
-        temp_pending = false;
+        // Opening truncates. A file that cannot be opened is untouched, so the
+        // copy goes with it; from here on the copy is the only complete one.
         const file = std.fs.cwd().createFile(target.path, .{}) catch return error.ReplaceFailed;
         defer file.close();
+        temp_pending = false;
         file.writeAll(bytes) catch return error.SerializeFailed;
         file.sync() catch return error.SerializeFailed;
         std.fs.cwd().deleteFile(tmp_path) catch {}; // The rewrite finished: the copy is no longer needed.
@@ -383,6 +385,29 @@ test "save target writes through hard links so every name sees the bytes" {
     // A shorter rewrite truncates: nothing of the old bytes is left behind.
     try write(testing.allocator, target, "x\n");
     try scratch.expectContent("dotfile", "x\n");
+    try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
+}
+
+extern "kernel32" fn SetFileAttributesW(name: [*:0]const u16, attributes: u32) callconv(.winapi) windows.BOOL;
+
+test "save target keeps a hard-linked file that cannot be opened as it was, with no copy left behind" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "old\n" });
+    try scratch.hardlink("dotfile", "config.ghostty");
+    const path = try scratch.path("config.ghostty");
+    defer testing.allocator.free(path);
+    const path_w = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, path);
+    defer testing.allocator.free(path_w);
+    // The attribute belongs to the file, so both names are read-only.
+    try testing.expect(SetFileAttributesW(path_w, windows.FILE_ATTRIBUTE_READONLY) != 0);
+    defer _ = SetFileAttributesW(path_w, windows.FILE_ATTRIBUTE_NORMAL);
+
+    const target = try resolve(testing.allocator, path);
+    defer target.deinit(testing.allocator);
+    try testing.expect(target.hard_linked);
+    try testing.expectError(error.ReplaceFailed, write(testing.allocator, target, "new\n"));
+    try scratch.expectContent("config.ghostty", "old\n");
     try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
 }
 
