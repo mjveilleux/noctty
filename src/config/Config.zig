@@ -3557,11 +3557,81 @@ fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []c
             reader.toss(bom.len);
         }
     }
-    var line_iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
+
+    // Windows PowerShell 5.1 writes UTF-16 with a byte order mark for `>` and
+    // Out-File. Read as bytes that is NUL-separated noise which sets nothing
+    // and says nothing, so decode it first.
+    var decoded: ?[]u8 = null;
+    defer if (decoded) |text| alloc.free(text);
+    var decoded_reader: std.Io.Reader = undefined;
+    var source = reader;
+    if (utf16ByteOrder(reader)) |order| {
+        reader.toss(2);
+        decoded = self.decodeUtf16(alloc, reader, order, path) catch |err| switch (err) {
+            error.InvalidUtf16 => return,
+            else => |e| return e,
+        };
+        log.warn("{s}: UTF-16 text, read as such; save it as UTF-8 so the Settings window can edit it", .{path});
+        decoded_reader = .fixed(decoded.?);
+        source = &decoded_reader;
+    }
+
+    var line_iter: cli.args.LineIterator = .{ .r = source, .filepath = path };
     var iter: ConfigFileIterator = .{ .inner = &line_iter };
     try self.loadIter(alloc, &iter);
 
     try self.expandPaths(std.fs.path.dirname(path).?);
+}
+
+/// The byte order of the UTF-16 text `reader` starts with, if its first two
+/// bytes are a byte order mark. Consumes nothing.
+fn utf16ByteOrder(reader: *std.Io.Reader) ?std.builtin.Endian {
+    const str = reader.peek(2) catch return null;
+    if (std.mem.eql(u8, str, "\xff\xfe")) return .little;
+    if (std.mem.eql(u8, str, "\xfe\xff")) return .big;
+    return null;
+}
+
+/// Read the rest of `reader` as UTF-16 and return it as UTF-8. A file that is
+/// not valid UTF-16 (or is absurdly large) is skipped with a diagnostic; an
+/// error here would otherwise end the whole configuration load. A trailing odd
+/// byte, as a truncated write leaves, is dropped.
+fn decodeUtf16(
+    self: *Config,
+    alloc: Allocator,
+    reader: *std.Io.Reader,
+    order: std.builtin.Endian,
+    path: []const u8,
+) ![]u8 {
+    const bytes = reader.allocRemaining(alloc, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+        error.StreamTooLong => return self.invalidUtf16(path, "is too large"),
+        else => |e| return e,
+    };
+    defer alloc.free(bytes);
+    const units = try alloc.alloc(u16, bytes.len / 2);
+    defer alloc.free(units);
+    for (units, 0..) |*unit, i| {
+        unit.* = std.mem.nativeToLittle(u16, std.mem.readInt(u16, bytes[i * 2 ..][0..2], order));
+    }
+    return std.unicode.utf16LeToUtf8Alloc(alloc, units) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => self.invalidUtf16(path, "is not valid UTF-16"),
+    };
+}
+
+fn invalidUtf16(self: *Config, path: []const u8, reason: []const u8) error{ OutOfMemory, InvalidUtf16 } {
+    const arena_alloc = self._arena.?.allocator();
+    const diag: cli.Diagnostic = .{
+        .message = std.fmt.allocPrintSentinel(
+            arena_alloc,
+            "config file {s}: {s}; not reading it. Save it as UTF-8",
+            .{ path, reason },
+            0,
+        ) catch return error.OutOfMemory,
+    };
+    self._diagnostics.append(arena_alloc, diag) catch return error.OutOfMemory;
+    self._replay_steps.append(arena_alloc, .{ .diagnostic = diag }) catch return error.OutOfMemory;
+    return error.InvalidUtf16;
 }
 
 /// Remove the `--launch-layout` steps at or after `from` in the replay log,
@@ -3793,6 +3863,90 @@ test "handle bom in config files" {
             cfg.@"abnormal-command-exit-runtime",
         );
     }
+}
+
+/// `text` as the bytes of a UTF-16 file, byte order mark first.
+fn testUtf16Bytes(alloc: Allocator, text: []const u8, order: std.builtin.Endian) ![]u8 {
+    const units = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
+    defer alloc.free(units);
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, if (order == .little) "\xff\xfe" else "\xfe\xff");
+    for (units) |unit| {
+        var pair: [2]u8 = undefined;
+        std.mem.writeInt(u16, &pair, std.mem.littleToNative(u16, unit), order);
+        try out.appendSlice(alloc, &pair);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "UTF-16 config files are read as the text they hold" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    // What Windows PowerShell 5.1 writes for `'...' > config`: UTF-16LE with
+    // a byte order mark and CRLF. The comment holds a character outside the
+    // basic plane, which takes a surrogate pair.
+    const text = "font-size = 14\r\n# caf\u{e9} \u{1f680}\r\ncursor-style = bar\r\n";
+    for ([_]std.builtin.Endian{ .little, .big }) |order| {
+        const data = try testUtf16Bytes(alloc, text, order);
+        defer alloc.free(data);
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+        try cfg.finalize();
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(@as(f32, 14), cfg.@"font-size");
+        try testing.expect(cfg.@"cursor-style" == .bar);
+    }
+
+    // A truncated write leaves half a code unit: the last byte is dropped.
+    {
+        const whole = try testUtf16Bytes(alloc, "font-size = 15\n", .little);
+        defer alloc.free(whole);
+        const data = try std.mem.concat(alloc, u8, &.{ whole, "\x0a" });
+        defer alloc.free(data);
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(@as(f32, 15), cfg.@"font-size");
+    }
+
+    // A lone surrogate is not text. The file is skipped with a diagnostic that
+    // names it, and loading goes on: an error here would end the whole load,
+    // since an included file is read the same way.
+    {
+        const data = "\xff\xfe\x00\xd8f\x00o\x00";
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
+        try testing.expectEqual(@as(usize, 1), cfg._diagnostics.list.items.len);
+        try testing.expect(std.mem.indexOf(u8, cfg._diagnostics.list.items[0].message, "config.ghostty") != null);
+        try testing.expect(std.mem.indexOf(u8, cfg._diagnostics.list.items[0].message, "UTF-16") != null);
+        try testing.expectEqual(@as(f32, 12), cfg.@"font-size");
+    }
+}
+
+test "a UTF-16 config file on disk is read through loadFile" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testUtf16Bytes(alloc, "font-size = 16\r\n", .little);
+    defer alloc.free(data);
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = data });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadFile(alloc, path);
+    try testing.expect(cfg._diagnostics.empty());
+    try testing.expectEqual(@as(f32, 16), cfg.@"font-size");
 }
 
 pub const OptionalFileAction = enum { loaded, not_found, @"error" };

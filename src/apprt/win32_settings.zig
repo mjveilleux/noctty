@@ -550,6 +550,10 @@ const StatusNote = enum {
     saved,
     saved_overridden,
     save_failed,
+    /// The config file is UTF-16 or UTF-32 text that a save cannot patch.
+    unsupported_encoding,
+    /// The config file was edited since Settings last read it.
+    changed_on_disk,
     close_failed,
     resolve_first,
     conflict_not_resolved,
@@ -565,6 +569,8 @@ const StatusNote = enum {
             .saved => "Settings saved.",
             .saved_overridden => "Saved, but a later config file or command-line option overrides some of these values, so they will not take effect.",
             .save_failed => "Save failed. Your edits are kept. Check that the config file can be written and is not open in another program, then try again.",
+            .unsupported_encoding => "Nothing was saved: the config file is not UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.",
+            .changed_on_disk => "The config file changed on disk. Review the values, then save again. Your edits are kept.",
             .close_failed => "Could not close the settings window; your edits are kept.",
             .resolve_first => "Fix the invalid fields or choose Keep mine or Use disk before saving.",
             .conflict_not_resolved => "Could not resolve the conflict; your edit is kept.",
@@ -1305,6 +1311,9 @@ pub const SaveError = error{
     ReplaceFailed,
     ReloadFailed,
     OutOfMemory,
+    /// The config file is UTF-16 or UTF-32 text. Patching it with UTF-8 lines
+    /// would leave a file that mixes encodings, so nothing is written.
+    UnsupportedEncoding,
     /// Write + reload both succeeded, but at least one GUI-edited
     /// field is masked by a later layer (included `config-file`,
     /// subsequent `--config-file`, `--config-default-files=false`
@@ -1320,6 +1329,16 @@ pub const SaveReloadOutcome = union(enum) {
     completed_masked,
     failed: SaveError,
 };
+
+/// What the status line says about a save that wrote nothing. Most failures
+/// share one hint (the file cannot be written); a file in the wrong encoding is
+/// something the user can fix, so it is named.
+fn saveFailureNote(err: SaveError) StatusNote {
+    return switch (err) {
+        error.UnsupportedEncoding => .unsupported_encoding,
+        else => .save_failed,
+    };
+}
 
 pub fn saveReloadOutcome(result: SaveError!void) SaveReloadOutcome {
     result catch |err| return switch (err) {
@@ -1970,6 +1989,8 @@ pub const SettingsWindow = struct {
             .saved, .saved_overridden => return self.status_note.text(),
             // These are about edits that are still there to be saved.
             .save_failed,
+            .unsupported_encoding,
+            .changed_on_disk,
             .close_failed,
             .resolve_first,
             .conflict_not_resolved,
@@ -4123,7 +4144,7 @@ pub const SettingsWindow = struct {
                 // is fixed, or close the window to discard.
                 if (apply_id) |id| if (!self.failApply(id)) return;
                 std.log.warn("settings: save failed err={}; draft preserved", .{err});
-                self.setNote(.save_failed);
+                self.setNote(saveFailureNote(err));
                 self.updateSaveEnabled();
             },
         }
