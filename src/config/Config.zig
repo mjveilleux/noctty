@@ -2523,8 +2523,8 @@ keybind: Keybinds = .{},
 ///
 /// Closing a window, quitting, `close_all_windows` and `close_tab:other` or
 /// `close_tab:right` ask once for all the surfaces they would close.
-/// `close_tab:this` does not ask, because the closed tab can be restored with
-/// `undo`.
+/// `close_tab:this` does not ask, because `undo` can bring the tab back
+/// (unless `undo-timeout` is 0).
 @"confirm-close-surface": ConfirmCloseSurface = .true,
 
 /// Whether or not to quit after the last surface is closed.

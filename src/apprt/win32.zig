@@ -9934,11 +9934,17 @@ pub const App = struct {
     /// the terminal under its own key handler: an access violation in
     /// `endKeySequence` in Debug builds.
     fn postQuit(self: *App, target: apprt.Target) void {
-        const near = self.undoRedoSurfaceForTarget(target);
-        const host = if (near) |surface| surface.host else null;
-        const post_host = host orelse if (self.hosts.items.len > 0) self.hosts.items[0] else null;
-        if (post_host) |candidate| if (candidate.hwnd) |hwnd| {
-            if (sys.PostMessageW(hwnd, c.WM_WINHOSTTY_QUIT, 0, 0) != 0) return;
+        // A quit from a terminal asks on its window. One from the app as a
+        // whole (a global key, automation) asks on the focused window, if
+        // any, else on a window with a running process.
+        const near: ?*Surface = switch (target) {
+            .app => self.focusedSurfaceForUndoRedo(),
+            .surface => |core_surface| self.findSurfaceByCore(core_surface),
+        };
+        const post_host = (if (near) |surface| surface.host else null) orelse
+            if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        if (post_host) |host| if (host.hwnd) |hwnd| {
+            if (sys.PostMessageW(hwnd, c.WM_WINHOSTTY_QUIT, @intFromBool(near != null), 0) != 0) return;
         };
         self.requestQuit(near);
     }
@@ -9946,26 +9952,30 @@ pub const App = struct {
     /// `quit` and `close_all_windows`. Unsaved Settings edits ask first, in
     /// the Settings window, which resumes the quit once they are saved or
     /// discarded (`settingsOnClosedThunk`). Then terminals that
-    /// `confirm-close-surface` asks about get one prompt, on `near`'s window
-    /// when it has one. Closed tabs kept for undo are not asked about.
+    /// `confirm-close-surface` asks about get one prompt: the one already
+    /// open, or on `near`'s window, or on a shown window with one of those
+    /// terminals. Closed tabs kept for undo are not asked about.
     fn requestQuit(self: *App, near: ?*Surface) void {
-        if (self.settings_window.holdQuitForUnsavedChanges()) return;
         if (!self.session_ending) {
+            if (self.settings_window.holdQuitForUnsavedChanges()) return;
             var count: usize = 0;
-            var prompt_host: ?*Host = null;
+            var open: ?*Host = null;
+            var busy: ?*Host = null;
             for (self.hosts.items) |host| {
+                if (host.showsConfirm(&appQuitConfirmAccept, self)) open = host;
                 const host_count = tabsCloseConfirmCount(host.tabs.items);
                 if (host_count == 0) continue;
                 count += host_count;
-                if (prompt_host == null) prompt_host = host;
+                if (busy == null or (!busy.?.isShown() and host.isShown())) busy = host;
             }
-            if (near) |surface| if (surface.host) |host| if (host.tabs.items.len > 0) {
-                prompt_host = host;
-            };
-            if (prompt_host) |host| if (count > 0) {
-                host.askBeforeClosing(.app, count, &appQuitConfirmAccept, self);
+            if (count > 0) {
+                var prompt_host = open orelse busy.?;
+                if (open == null) if (near) |surface| if (surface.host) |near_host| {
+                    if (near_host.tabs.items.len > 0) prompt_host = near_host;
+                };
+                prompt_host.askBeforeClosing(.app, count, &appQuitConfirmAccept, self);
                 return;
-            };
+            }
         }
         self.quitConfirmed();
     }
@@ -19719,9 +19729,13 @@ const Host = struct {
         on_accept: *const fn (userdata: ?*anyopaque) void,
         userdata: *anyopaque,
     ) void {
-        self.presentForPrompt();
-        if (self.confirm_payload) |payload| {
-            if (payload.on_accept == on_accept and payload.userdata == userdata) return;
+        const raised = self.presentForPrompt();
+        if (self.showsConfirm(on_accept, userdata)) {
+            // Raising the window focused its terminal; the prompt keeps the keys.
+            if (raised) if (self.overlay_accept_hwnd) |accept| {
+                _ = sys.SetFocus(accept);
+            };
+            return;
         }
         var body: [256]u8 = undefined;
         self.showConfirm(closeScopePrompt(scope, count, &body), on_accept, null, userdata) catch |err| {
@@ -19729,13 +19743,25 @@ const Host = struct {
         };
     }
 
+    /// Shown on screen, minimized included; a hidden quick terminal is not.
+    fn isShown(self: *const Host) bool {
+        const hwnd = self.hwnd orelse return false;
+        return sys.IsWindowVisible(hwnd) != 0;
+    }
+
+    fn showsConfirm(self: *const Host, on_accept: *const fn (userdata: ?*anyopaque) void, userdata: *anyopaque) bool {
+        const payload = self.confirm_payload orelse return false;
+        return payload.on_accept == on_accept and payload.userdata == userdata;
+    }
+
     /// Restore and raise the window for a prompt unless it is already the
-    /// foreground window.
-    fn presentForPrompt(self: *Host) void {
-        const hwnd = self.hwnd orelse return;
-        if (sys.GetForegroundWindow() == hwnd and sys.IsIconic(hwnd) == 0) return;
-        const surface = self.activeSurface() orelse return;
+    /// foreground window. Returns whether it did.
+    fn presentForPrompt(self: *Host) bool {
+        const hwnd = self.hwnd orelse return false;
+        if (sys.GetForegroundWindow() == hwnd and sys.IsIconic(hwnd) == 0) return false;
+        const surface = self.activeSurface() orelse return false;
         self.app.activateSurface(surface);
+        return true;
     }
 
     /// Close every terminal in the window without asking.
@@ -24632,6 +24658,8 @@ fn hostCloseConfirmAccept(userdata: ?*anyopaque) void {
 /// window the quit destroys, including the one showing the prompt.
 fn appQuitConfirmAccept(userdata: ?*anyopaque) void {
     const app: *App = @ptrCast(@alignCast(userdata orelse return));
+    // Settings may have gained unsaved edits while this prompt waited.
+    if (app.settings_window.holdQuitForUnsavedChanges()) return;
     app.quitConfirmed();
 }
 
@@ -28336,8 +28364,9 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             return 0;
         },
         c.WM_WINHOSTTY_QUIT => {
-            // May destroy this window: nothing after the call reads `v`.
-            if (host) |v| v.app.requestQuit(v.activeSurface());
+            // wParam: whether the quit came from this window. May destroy
+            // this window: nothing after the call reads `v`.
+            if (host) |v| v.app.requestQuit(if (wParam != 0) v.activeSurface() else null);
             return 0;
         },
 
@@ -37201,26 +37230,34 @@ test "win32 quit asks once on the window it came from" {
     });
     defer session.deinit();
     app.running = true;
+    // Ids for the lookups Settings makes when it closes. The inert fixture
+    // cores are otherwise only read for `readonly`, which `needsConfirmQuit`
+    // checks before anything else and which stands in for a busy terminal.
+    surface_a.core_surface.id = 1;
+    surface_b.core_surface.id = 2;
+    surface_b.core_surface.readonly = true;
 
     // The busy terminal is in the other window; the prompt still shows
     // where the quit came from.
-    surface_b.core_surface.readonly = true;
     surface_b.core_initialized = true;
     try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
     try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
     try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
     try std.testing.expectEqualStrings("Quit noctty?", host_a.confirm_payload.?.title);
     try std.testing.expect(app.running);
+    // Asking again from the other window keeps the one prompt.
+    try std.testing.expect(try app.performAction(.{ .surface = surface_b.core() }, .quit, {}));
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
     host_a.invokeConfirmCancel();
 
-    // `close_all_windows` quits too, and asks the same way; with no window
-    // named, the first window asks.
+    // `close_all_windows` quits too, and asks the same way. With no window
+    // named and none focused, the window with the running process asks.
     try std.testing.expect(try app.performAction(.app, .close_all_windows, {}));
     surface_b.core_initialized = false;
-    try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_b.overlay_mode);
     try std.testing.expect(app.running);
     try std.testing.expectEqual(@as(usize, 2), app.hosts.items.len);
-    host_a.invokeConfirmCancel();
+    host_b.invokeConfirmCancel();
 
     // Save or Discard in a Settings prompt that a quit raised resumes it,
     // on the window Settings hands focus back to.
@@ -37232,6 +37269,20 @@ test "win32 quit asks once on the window it came from" {
     try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
     host_a.invokeConfirmCancel();
     try std.testing.expect(app.running);
+
+    // With a window to post to, the quit waits for the message loop: core
+    // keeps using the terminal whose key asked for it after this returns.
+    const hwnd = try createTestHostWindow();
+    defer _ = sys.DestroyWindow(hwnd);
+    host_a.hwnd = hwnd;
+    defer host_a.hwnd = null;
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host_a.overlay_mode);
+    var msg: sys.MSG = undefined;
+    try std.testing.expect(sys.PeekMessageW(&msg, hwnd, c.WM_WINHOSTTY_QUIT, c.WM_WINHOSTTY_QUIT, c.PM_REMOVE) != 0);
+    try std.testing.expectEqual(@as(WPARAM, 1), msg.wParam);
 }
 
 test "win32 close prompts count the terminals they would end" {

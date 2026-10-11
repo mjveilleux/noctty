@@ -1582,6 +1582,7 @@ pub const SettingsWindow = struct {
     close_prompt_measure_width: i32 = -1,
     close_prompt_measure_dpi: u32 = 0,
     close_prompt_measure_saving: bool = false,
+    close_prompt_measure_quitting: bool = false,
     close_prompt_measure_height: i32 = 0,
     edit_scrollback: ?HWND = null,
     edit_font_family: ?HWND = null,
@@ -4149,7 +4150,7 @@ pub const SettingsWindow = struct {
 
     fn syncClosePromptText(self: *SettingsWindow, announce: bool) void {
         const text = self.text_close_prompt orelse return;
-        setWindowTextUtf8(text, closePromptText(self.save_in_flight));
+        setWindowTextUtf8(text, closePromptText(self.save_in_flight, self.quit_after_close));
         if (announce) {
             sys.NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, text, @bitCast(OBJID_CLIENT), @bitCast(CHILDID_SELF));
         }
@@ -4193,6 +4194,11 @@ pub const SettingsWindow = struct {
         if (sys.IsIconic(hwnd) != 0) _ = sys.ShowWindow(hwnd, SW_RESTORE);
         _ = SetForegroundWindow(hwnd);
         self.quit_after_close = true;
+        // An open prompt still says "closing"; say "quitting" instead.
+        if (self.close_prompt_visible) {
+            self.syncClosePromptText(true);
+            layoutChildren(self);
+        }
         self.showClosePrompt();
         return true;
     }
@@ -5492,9 +5498,11 @@ fn closePromptCanCancel(visible: bool, close_posted: bool) bool {
     return visible and !close_posted;
 }
 
-fn closePromptText(save_in_flight: bool) []const u8 {
+fn closePromptText(save_in_flight: bool, quitting: bool) []const u8 {
     return if (save_in_flight)
         "Saving changes. Settings will close when saving finishes. Choose Keep editing to keep it open."
+    else if (quitting)
+        "Save changes before quitting?"
     else
         "Save changes before closing?";
 }
@@ -5527,10 +5535,11 @@ test "settings dirty close transition is conservative and idempotent" {
 }
 
 test "settings close prompt uses one display and measurement text source" {
-    try std.testing.expectEqualStrings("Save changes before closing?", closePromptText(false));
+    try std.testing.expectEqualStrings("Save changes before closing?", closePromptText(false, false));
+    try std.testing.expectEqualStrings("Save changes before quitting?", closePromptText(false, true));
     try std.testing.expectEqualStrings(
         "Saving changes. Settings will close when saving finishes. Choose Keep editing to keep it open.",
-        closePromptText(true),
+        closePromptText(true, false),
     );
 }
 
@@ -6300,6 +6309,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     if (self.close_prompt_measure_width == pane_width and
         self.close_prompt_measure_dpi == self.dpi and
         self.close_prompt_measure_saving == self.save_in_flight and
+        self.close_prompt_measure_quitting == self.quit_after_close and
         self.close_prompt_measure_height > 0)
     {
         return self.close_prompt_measure_height;
@@ -6313,7 +6323,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     }
 
     var text_w: [256]u16 = undefined;
-    const text = std.mem.span(utf8ToW(&text_w, closePromptText(self.save_in_flight)));
+    const text = std.mem.span(utf8ToW(&text_w, closePromptText(self.save_in_flight, self.quit_after_close)));
     var measure = RECT{
         .left = 0,
         .top = 0,
@@ -6331,6 +6341,7 @@ fn closePromptMeasuredHeight(self: *SettingsWindow, pane_width: i32) i32 {
     self.close_prompt_measure_width = pane_width;
     self.close_prompt_measure_dpi = self.dpi;
     self.close_prompt_measure_saving = self.save_in_flight;
+    self.close_prompt_measure_quitting = self.quit_after_close;
     self.close_prompt_measure_height = height;
     return height;
 }
