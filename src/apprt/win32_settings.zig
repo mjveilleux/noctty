@@ -1149,8 +1149,13 @@ const viewport_class_name = std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32
 const edit_text_max_code_units: usize = 4096;
 const edit_text_max_utf8: usize = edit_text_max_code_units * 3;
 
+/// `scrollback-limit` is a byte budget per terminal, and 0 turns scrollback off
+/// (Config.zig, Screen.zig); there is no "unlimited". Only new terminals read it.
+/// The accessible name stays the prefix, "Scrollback limit".
+const scrollback_label = "Scrollback limit (bytes; 0 = off; new terminals only)";
+
 const settings_label_specs = [_][]const u8{
-    "Scrollback limit (rows, 0 = unlimited)",
+    scrollback_label,
     "Close confirmation",
     "Copy on select",
     "Font family fallbacks (comma-separated)",
@@ -6823,6 +6828,23 @@ const dialog_test = struct {
     extern "user32" fn GetNextDlgTabItem(dialog: HWND, control: ?HWND, previous: BOOL) callconv(.winapi) ?HWND;
     extern "user32" fn GetKeyboardState(keys: *[256]u8) callconv(.winapi) BOOL;
     extern "user32" fn SetKeyboardState(keys: *const [256]u8) callconv(.winapi) BOOL;
+
+    /// Make exactly these modifiers the ones the calling thread sees held, and
+    /// no other key. The whole 256-entry table is replaced, then read back
+    /// through `GetKeyState`, which is what the code under test reads: a
+    /// table the system refreshed from the real keyboard in between fails here
+    /// with the key that leaked, not later in an unrelated assertion.
+    fn holdKeys(held: struct { ctrl: bool = false, alt: bool = false, shift: bool = false }) !void {
+        var keys: [256]u8 = @splat(0);
+        const down: u8 = 0x80;
+        if (held.ctrl) keys[VK_CONTROL] = down;
+        if (held.alt) keys[VK_MENU] = down;
+        if (held.shift) keys[VK_SHIFT] = down;
+        try std.testing.expect(SetKeyboardState(&keys) != 0);
+        try std.testing.expectEqual(held.ctrl, win32_input.keyPressed(VK_CONTROL));
+        try std.testing.expectEqual(held.alt, win32_input.keyPressed(VK_MENU));
+        try std.testing.expectEqual(held.shift, win32_input.keyPressed(VK_SHIFT));
+    }
     extern "user32" fn GetNextDlgGroupItem(dialog: HWND, control: ?HWND, previous: BOOL) callconv(.winapi) ?HWND;
     extern "gdi32" fn BitBlt(dst: HDC, x: i32, y: i32, width: i32, height: i32, src: HDC, src_x: i32, src_y: i32, rop: u32) callconv(.winapi) BOOL;
     extern "user32" fn HideCaret(hwnd: ?HWND) callconv(.winapi) BOOL;
@@ -7238,18 +7260,29 @@ test "settings Ctrl+S reaches Save through the accelerator hook" {
             settings.syncCursorStyleFromCombo();
             _ = sys.SetFocus(settings.edit_font_size.?);
 
+            // The thread's key table starts as a copy of what the real keyboard
+            // holds, so a test that sets only Ctrl in it inherits any Shift,
+            // Alt or Ctrl the person running the suite has down (failed 2 of 6
+            // runs on a reviewer's machine). Own every key the shortcut reads.
+            var original: [256]u8 = undefined;
+            try std.testing.expect(dialog_test.GetKeyboardState(&original) != 0);
+            defer _ = dialog_test.SetKeyboardState(&original);
+
             // Without Ctrl the key is not ours.
             const focus = sys.GetFocus().?;
+            try dialog_test.holdKeys(.{});
             try std.testing.expect(!settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
             try std.testing.expectEqual(@as(u32, 0), fixture.saved);
 
-            // With the thread's Ctrl key down it is consumed and saves.
-            var keys: [256]u8 = undefined;
-            try std.testing.expect(dialog_test.GetKeyboardState(&keys) != 0);
-            const original = keys;
-            defer _ = dialog_test.SetKeyboardState(&original);
-            keys[VK_CONTROL] = 0x80;
-            try std.testing.expect(dialog_test.SetKeyboardState(&keys) != 0);
+            // Ctrl with Shift or Alt is a different chord.
+            try dialog_test.holdKeys(.{ .ctrl = true, .shift = true });
+            try std.testing.expect(!settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
+            try dialog_test.holdKeys(.{ .ctrl = true, .alt = true });
+            try std.testing.expect(!settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
+            try std.testing.expectEqual(@as(u32, 0), fixture.saved);
+
+            // With only the thread's Ctrl key down it is consumed and saves.
+            try dialog_test.holdKeys(.{ .ctrl = true });
             try std.testing.expect(settings.handleAccelerator(focus, WM_KEYDOWN, 'S', 0));
             try std.testing.expectEqual(@as(u32, 1), fixture.saved);
         }
@@ -7978,6 +8011,54 @@ test "settings diff writes every field's values without debug syntax" {
         try std.testing.expect(line[line.len - 1] == '\n');
         try expectNoInternalSyntax(line);
     }
+}
+
+test "settings scrollback label states the unit, that 0 turns scrollback off, and who it applies to" {
+    // `scrollback-limit` is bytes per terminal, 0 disables scrollback and
+    // there is no unlimited setting (Config.zig, Screen.zig); a change reaches
+    // terminals created afterwards. The old label said "rows, 0 = unlimited".
+    comptime std.debug.assert(@FieldType(Config, "scrollback-limit") == usize);
+    try std.testing.expectEqualStrings(scrollback_label, settings_label_specs[0]);
+    for ([_][]const u8{ "bytes", "0 = off", "new terminals" }) |fact| {
+        try std.testing.expect(std.mem.indexOf(u8, scrollback_label, fact) != null);
+    }
+    for ([_][]const u8{ "rows", "unlimited" }) |claim| {
+        try std.testing.expect(std.mem.indexOf(u8, scrollback_label, claim) == null);
+    }
+    // The accessible name is the visible label's first words, so a screen
+    // reader user hears what the sighted user reads.
+    try std.testing.expect(std.mem.startsWith(u8, scrollback_label, settings_control_specs[0].name));
+    try std.testing.expect(std.mem.startsWith(u8, scrollback_label, SettingField.scrollback_limit.label()));
+}
+
+test "settings labels fit on one line in the narrowest two-column lane" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            for ([_]u32{ 96, 144, 192 }) |dpi| {
+                dialog_test.simulateDpi(fixture.hwnd(), dpi);
+                const lane = @divTrunc(scaleForDpi(settings_two_column_min_width, dpi) - scaleForDpi(settings_column_gap, dpi), 2);
+                for (settings.field_labels, settings_label_specs) |maybe_label, spec| {
+                    const label = maybe_label.?;
+                    const hdc = GetDC(label) orelse return error.NoDC;
+                    defer _ = ReleaseDC(label, hdc);
+                    const raw_font: usize = @bitCast(SendMessageW(label, WM_GETFONT, 0, 0));
+                    const previous = SelectObject(hdc, @ptrFromInt(raw_font));
+                    defer _ = SelectObject(hdc, previous);
+                    var text_w: [256:0]u16 = undefined;
+                    const length = std.unicode.utf8ToUtf16Le(&text_w, spec) catch return error.LabelTooLong;
+                    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                    _ = DrawTextW(hdc, &text_w, @intCast(length), &rect, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+                    if (rect.right - rect.left > lane) {
+                        std.debug.print("label \"{s}\" is {d}px wide in a {d}px lane at {d} dpi\n", .{ spec, rect.right - rect.left, lane, dpi });
+                        return error.LabelWiderThanLane;
+                    }
+                }
+            }
+        }
+    }.body);
 }
 
 test "settings fields carry a label, a config key and palette words" {
