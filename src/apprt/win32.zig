@@ -9188,6 +9188,30 @@ pub const App = struct {
         self.auditShellNativeMapping("focus");
     }
 
+    /// After a close the shell model has chosen what is focused: the pane
+    /// and tab that were survive, and when one of them closed, the first
+    /// pane of the closed pane's sibling or the tab now at the closed tab's
+    /// place takes over. Native focus follows that choice (decision D7),
+    /// matched by stable ID, since a close renumbers split-tree handles and
+    /// shifts tab indices.
+    fn followShellFocus(self: *App, host: *Host) void {
+        if (!self.shell_runtime_initialized) return;
+        const state = &self.shell_runtime.state;
+        const window = state.windowConst(host.shell_id orelse return) orelse return;
+        for (host.tabs.items, 0..) |*tab, index| {
+            const tab_id = tab.shell_id orelse continue;
+            if (window.active_tab) |active| {
+                if (active.eql(tab_id)) host.active_tab = index;
+            }
+            const focused_pane = (state.tabConst(tab_id) orelse continue).focused_pane;
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| {
+                const pane_id = entry.view.shell_id orelse continue;
+                if (pane_id.eql(focused_pane)) tab.focused = entry.handle;
+            }
+        }
+    }
+
     fn syncTaskbarProgressForHost(self: *App, host_id: u32) void {
         const taskbar = if (self.taskbar_progress) |*value| value else return;
         const host = self.findHostById(host_id) orelse return;
@@ -9341,6 +9365,8 @@ pub const App = struct {
                 host.tabs.items[host.active_tab].id
             else
                 null;
+            // Only closing the pane the window shows as focused moves focus.
+            const was_active_surface = host.activeSurface() == surface;
             surface.invalidateStructuralHistoryForDestroy();
             host.discardStructuralEntriesReferencing(surface);
 
@@ -9361,9 +9387,7 @@ pub const App = struct {
                         var removed = host.tabs.orderedRemove(i);
                         host.destroyTabButton(&removed);
                         removed.deinit();
-                        if (host.active_tab >= host.tabs.items.len and host.tabs.items.len > 0) {
-                            host.active_tab = host.tabs.items.len - 1;
-                        }
+                        host.active_tab = activeTabAfterRemoval(host.active_tab, i, host.tabs.items.len);
                     } else {
                         const next_tree = if (surface.pending_close_tree) |prepared_tree| prepared: {
                             surface.pending_close_tree = null;
@@ -9377,10 +9401,17 @@ pub const App = struct {
                                 break;
                             };
                         };
+                        const focused = tab.focusedSurface();
                         tab.tree.deinit();
                         tab.tree = next_tree;
-                        var it = tab.tree.iterator();
-                        tab.focused = it.next().?.handle;
+                        // Focus stays on a pane that survives; the handles
+                        // are renumbered, so find it again. When the focused
+                        // pane itself closed, the shell model picks the next
+                        // one (`followShellFocus`) and the first pane stands
+                        // in until then.
+                        var first = tab.tree.iterator();
+                        tab.focused = (if (focused) |kept| tab.findHandle(kept) else null) orelse
+                            first.next().?.handle;
                         // The closed split may have been what the tab's
                         // status badge was showing.
                         host.refreshTabStatus(i);
@@ -9388,7 +9419,6 @@ pub const App = struct {
                     break;
                 }
             }
-            host.notifyActiveTabUiaSelectionChanged(previous_tab_id);
 
             if (surface.pending_close_tree) |*unused_tree| {
                 unused_tree.deinit();
@@ -9407,7 +9437,9 @@ pub const App = struct {
                 prepared.deinit();
                 surface.pending_shell_close = null;
                 shell_mapping_changed = true;
+                self.followShellFocus(host);
             }
+            host.notifyActiveTabUiaSelectionChanged(previous_tab_id);
 
             var shell_mapping_stable = true;
             if (host.tabs.items.len == 0) {
@@ -9419,7 +9451,15 @@ pub const App = struct {
                     self.removeHost(host);
                 }
             } else if (self.running) {
-                if (activeTab(host)) |tab| if (tab.focusedSurface()) |replacement| self.activateSurface(replacement);
+                // A close never restores, raises or takes focus from a
+                // window the user is not looking at, and moves focus only
+                // when the pane that had it closed.
+                if (activeTab(host)) |tab| if (tab.focusedSurface()) |replacement| {
+                    if (was_active_surface and tabSeenByUser(host, host.active_tab))
+                        self.activateSurface(replacement)
+                    else
+                        self.activateSurfaceNoFocus(replacement);
+                };
                 // Relayout after tab removal because the chrome
                 // reservation may have changed. In this fork,
                 // `.auto` still shows the row since it carries the
@@ -9482,6 +9522,18 @@ pub const App = struct {
         };
         const next_handle = (try found.tab.tree.goto(self.core_app.alloc, from, goto)) orelse return false;
         found.tab.focused = next_handle;
+        // A zoomed tab shows only the zoomed pane, so moving away unzooms,
+        // or with `split-preserve-zoom = navigation` zooms the pane moved
+        // to. Lay out before focusing it, so it is visible when it gets focus.
+        if (found.tab.tree.zoomed) |zoomed| {
+            const next_zoom: ?SplitTreeSurface.Node.Handle =
+                if (self.config.@"split-preserve-zoom".navigation) next_handle else null;
+            if (next_zoom != zoomed) {
+                found.tab.tree.zoom(next_zoom);
+                current.invalidateRedoForUnsupportedTabStructuralAction();
+                try found.host.layout();
+            }
+        }
         const next_surface = found.tab.focusedSurface() orelse return false;
         self.activateSurface(next_surface);
         return true;
@@ -12931,12 +12983,7 @@ const Host = struct {
             entry.view.setVisible(false);
         }
 
-        self.active_tab = if (self.tabs.items.len == 0)
-            0
-        else if (index >= self.tabs.items.len)
-            self.tabs.items.len - 1
-        else
-            index;
+        self.active_tab = activeTabAfterRemoval(self.active_tab, index, self.tabs.items.len);
         self.notifyActiveTabUiaSelectionChanged(previous_tab_id);
 
         return .{
@@ -13021,16 +13068,12 @@ const Host = struct {
 
         value.index = index;
         value.tab = removed;
-        self.active_tab = if (self.tabs.items.len == 0)
-            0
-        else if (index >= self.tabs.items.len)
-            self.tabs.items.len - 1
-        else
-            index;
+        const previous_active = self.active_tab;
+        self.active_tab = activeTabAfterRemoval(previous_active, index, self.tabs.items.len);
         if (shell_prepared) |*prepared| prepared.commit(&self.app.shell_runtime) catch |err| {
             try self.tabs.insert(self.app.core_app.alloc, index, removed);
             value.tab = null;
-            self.active_tab = index;
+            self.active_tab = previous_active;
             var restored_it = self.tabs.items[index].tree.iterator();
             while (restored_it.next()) |entry| entry.view.host_active = true;
             return err;
@@ -15780,6 +15823,19 @@ const Host = struct {
         }
         self.forceHostCompositionPaint();
         return false;
+    }
+
+    /// Close tab `index` from its own button (its X, a middle click, Delete)
+    /// where it is, without selecting it first, so closing a background tab
+    /// leaves the active tab in front. `close_tab:this` keeps the tab for
+    /// undo and never asks.
+    fn closeTabInPlace(self: *Host, index: usize) bool {
+        if (index >= self.tabs.items.len) return false;
+        const surface = self.tabs.items[index].focusedSurface() orelse return false;
+        return self.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
+            log.warn("tab close failed err={}", .{err});
+            return false;
+        };
     }
 
     /// Recompute what tab `index` shows for its programs' status (OSC 7501)
@@ -24598,6 +24654,25 @@ fn buildToastLaunchForSurface(
     });
 }
 
+/// The active tab's index once tab `removed` is gone and `remaining` tabs
+/// are left: the same tab when another one closed; when the active tab
+/// itself closed, the tab now at its place, or the last one. The shell
+/// model's `closeTab` and `detachTab` choose the same way.
+fn activeTabAfterRemoval(active: usize, removed: usize, remaining: usize) usize {
+    if (remaining == 0) return 0;
+    if (removed < active) return active - 1;
+    return @min(active, remaining - 1);
+}
+
+test "win32 closing a tab keeps the active tab active" {
+    // [A, B, C] with B active.
+    try std.testing.expectEqual(@as(usize, 0), activeTabAfterRemoval(1, 0, 2)); // A closes: B
+    try std.testing.expectEqual(@as(usize, 1), activeTabAfterRemoval(1, 2, 2)); // C closes: B
+    try std.testing.expectEqual(@as(usize, 1), activeTabAfterRemoval(1, 1, 2)); // B closes: C
+    try std.testing.expectEqual(@as(usize, 1), activeTabAfterRemoval(2, 2, 2)); // last closes: new last
+    try std.testing.expectEqual(@as(usize, 0), activeTabAfterRemoval(0, 0, 0));
+}
+
 /// Whether the user can see tab `index` of `host` right now: it is the
 /// window's active tab, and the window is the foreground window and not
 /// minimized.
@@ -27296,15 +27371,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                         .activate => {
                             _ = v.activateTabIndex(index);
                         },
-                        .close => {
-                            if (v.activateTabIndex(index)) {
-                                if (v.activeSurface()) |surface| {
-                                    _ = v.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
-                                        log.warn("tab close button action failed err={}", .{err});
-                                    };
-                                }
-                            }
-                        },
+                        .close => _ = v.closeTabInPlace(index),
                         .none => {},
                     }
                     return 0;
@@ -27455,14 +27522,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                                 }
                             },
                             .close => {
-                                if (v.tabs.items.len > 1 and v.activateTabIndex(index)) {
-                                    if (v.activeSurface()) |surface| {
-                                        _ = v.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
-                                            log.warn("tab close key action failed err={}", .{err});
-                                        };
-                                        return 0;
-                                    }
-                                }
+                                if (v.tabs.items.len > 1 and v.closeTabInPlace(index)) return 0;
                             },
                             .overview => {
                                 if (v.activateTabIndex(index)) {
@@ -27476,14 +27536,7 @@ fn tabButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv
                     }
                 },
                 c.WM_MBUTTONUP => {
-                    if (v.tabs.items.len > 1 and v.activateTabIndex(index)) {
-                        if (v.activeSurface()) |surface| {
-                            _ = v.app.closeTab(.{ .surface = surface.core() }, .this) catch |err| {
-                                log.warn("tab middle-click close action failed err={}", .{err});
-                            };
-                            return 0;
-                        }
-                    }
+                    if (v.tabs.items.len > 1 and v.closeTabInPlace(index)) return 0;
                 },
                 c.WM_LBUTTONDBLCLK => {
                     if (v.activateTabIndex(index)) {
@@ -37331,6 +37384,46 @@ test "win32 closeTab this on last tab detaches tab for undo" {
     try std.testing.expectEqual(@as(usize, 0), surface.undo_stack.redoDepth());
 }
 
+test "win32 closing a background tab from its button leaves the active tab in front" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var surface_d: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 2 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+            .{ .storage = &surface_d, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+            .{ .host = &host, .surface = &surface_c, .id = 3 },
+            .{ .host = &host, .surface = &surface_d, .id = 4 },
+        },
+    });
+    defer session.deinit();
+
+    // C is in front. Closing A, before it, and then D, after it, keeps C.
+    try std.testing.expect(host.closeTabInPlace(0));
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try std.testing.expect(host.closeTabInPlace(2));
+    try std.testing.expectEqual(@as(?*Surface, &surface_c), host.activeSurface());
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    // Both can be undone.
+    try std.testing.expectEqual(@as(usize, 2), host.structural_undo_entries.items.len);
+}
+
 test "win32 prune preserves empty host while structural undo remains" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -38325,6 +38418,138 @@ test "win32 windowDestroyed detaches the removed tab UIA provider" {
             provider,
         ) == null,
     );
+}
+
+test "win32 closing a split keeps focus, or gives it to the closed pane's sibling" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+
+    // [A | (B / C)], natively and in the shell model.
+    const Split = struct {
+        fn native(tab: *Tab, at: *Surface, direction: SplitTreeSurface.Split.Direction, view: *Surface) !void {
+            var inserted = try SplitTreeSurface.init(std.testing.allocator, view);
+            defer inserted.deinit();
+            const next = try tab.tree.split(std.testing.allocator, tab.findHandle(at).?, direction, 0.5, &inserted);
+            tab.tree.deinit();
+            tab.tree = next;
+        }
+        fn shell(target: *App, at: *Surface, direction: win32_shell.model.Direction, view: *Surface) !void {
+            var prepared = try target.shell_runtime.prepare(.{ .split_pane = .{ .pane = at.shell_id.?, .direction = direction } });
+            defer prepared.deinit();
+            try prepared.commit(&target.shell_runtime);
+            view.shell_id = prepared.created.pane;
+            view.shell_committed = true;
+        }
+        /// What `Surface.requestClose` prepares before it destroys the pane.
+        fn close(target: *App, tab: *Tab, view: *Surface) !void {
+            view.pending_close_tree = try tab.tree.remove(std.testing.allocator, tab.findHandle(view).?);
+            view.pending_shell_close = try target.shell_runtime.prepare(.{ .close_pane = view.shell_id.? });
+            target.windowDestroyed(view);
+        }
+    };
+    var window = try app.shell_runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&app.shell_runtime);
+    host.shell_id = window.created.window;
+    surface_a.shell_id = window.created.pane;
+    surface_a.shell_committed = true;
+    var tab = try Tab.init(std.testing.allocator, 1, &surface_a);
+    tab.shell_id = window.created.tab;
+    try host.tabs.append(std.testing.allocator, tab);
+    const native_tab = &host.tabs.items[0];
+    try Split.native(native_tab, &surface_a, .right, &surface_b);
+    try Split.shell(&app, &surface_a, .right, &surface_b);
+    try Split.native(native_tab, &surface_b, .down, &surface_c);
+    try Split.shell(&app, &surface_b, .down, &surface_c);
+    // The user is in B; C exits in the background. Focus stays on B, not on
+    // the tree's first pane, A.
+    native_tab.focused = native_tab.findHandle(&surface_b).?;
+    _ = try app.shell_runtime.focusPane(surface_b.shell_id.?);
+    try app.validateShellNativeMapping();
+    try Split.close(&app, native_tab, &surface_c);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), native_tab.focusedSurface());
+    try app.validateShellNativeMapping();
+
+    // Split B again and close the focused new pane: focus goes to its
+    // sibling B, as the shell model chooses, not to A.
+    try Split.native(native_tab, &surface_b, .down, &surface_c);
+    try Split.shell(&app, &surface_b, .down, &surface_c);
+    native_tab.focused = native_tab.findHandle(&surface_c).?;
+    _ = try app.shell_runtime.focusPane(surface_c.shell_id.?);
+    try app.validateShellNativeMapping();
+    try Split.close(&app, native_tab, &surface_c);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), native_tab.focusedSurface());
+    try app.validateShellNativeMapping();
+}
+
+test "win32 a background tab's exit keeps the active tab" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .shell_runtime_initialized = true,
+    });
+    defer session.deinit();
+
+    // Tabs [A, B, C] with B active, natively and in the shell model.
+    var window = try app.shell_runtime.prepare(.create_window);
+    defer window.deinit();
+    try window.commit(&app.shell_runtime);
+    host.shell_id = window.created.window;
+    const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c };
+    for (surfaces, 0..) |surface, index| {
+        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = window.created.window.? });
+        defer if (created) |*prepared| prepared.deinit();
+        if (created) |*prepared| try prepared.commit(&app.shell_runtime);
+        surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
+        surface.shell_committed = true;
+        var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), surface);
+        tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
+        try host.tabs.append(std.testing.allocator, tab);
+    }
+    host.active_tab = 1;
+    _ = try app.shell_runtime.focusPane(surface_b.shell_id.?);
+    try app.validateShellNativeMapping();
+
+    // A's program exits: its tab closes and B stays active (C before).
+    surface_a.pending_shell_close = try app.shell_runtime.prepare(.{ .close_tab = host.tabs.items[0].shell_id.? });
+    app.windowDestroyed(&surface_a);
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), host.activeSurface());
+    try app.validateShellNativeMapping();
 }
 
 test "win32 terminal undo snapshot restores terminal state" {
@@ -47327,6 +47552,51 @@ test "win32 gotoSplitFallback maps only previous and next" {
     try std.testing.expect(App.gotoSplitFallbackDirection(.next) != null);
     try std.testing.expect(App.gotoSplitFallbackDirection(.left) == null);
     try std.testing.expect(App.gotoSplitFallbackDirection(.right) == null);
+}
+
+test "win32 goto_split out of a zoomed pane unzooms, or moves the zoom" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{.{ .host = &host, .surface = &surface_a, .id = 1 }},
+    });
+    defer session.deinit();
+    var inserted = try SplitTreeSurface.init(std.testing.allocator, &surface_b);
+    defer inserted.deinit();
+    const tab = &host.tabs.items[0];
+    const next_tree = try tab.tree.split(std.testing.allocator, .root, .right, 0.5, &inserted);
+    tab.tree.deinit();
+    tab.tree = next_tree;
+    tab.focused = tab.findHandle(&surface_a).?;
+    tab.tree.zoom(tab.focused);
+    try pushUndoAndRedoBranch(&surface_a.undo_stack, std.testing.allocator, 80);
+
+    // Default: moving to B unzooms, so B is not left hidden behind A. The
+    // zoom change is a structural edit and drops the redo branch.
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .goto_split, .right));
+    try std.testing.expectEqual(@as(?*Surface, &surface_b), tab.focusedSurface());
+    try std.testing.expect(tab.tree.zoomed == null);
+    try std.testing.expectEqual(@as(usize, 0), surface_a.undo_stack.redoDepth());
+
+    // `split-preserve-zoom = navigation`: the zoom follows to the pane.
+    tab.tree.zoom(tab.focused);
+    app.config.@"split-preserve-zoom".navigation = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_b.core() }, .goto_split, .left));
+    try std.testing.expectEqual(@as(?*Surface, &surface_a), tab.focusedSurface());
+    try std.testing.expectEqual(tab.focused, tab.tree.zoomed.?);
 }
 
 test "win32 command palette action parser accepts simple actions" {
