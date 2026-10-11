@@ -34743,6 +34743,7 @@ pub const Surface = struct {
 
     fn destroy(self: *Surface) void {
         const alloc = self.app.core_app.alloc;
+        const own_hwnd = self.hwnd;
         self.noteBenchmarkMemoryStage(.destroy_begin, null);
         self.destroy_on_wm_destroy = false;
         self.deferred_char.clear();
@@ -34821,6 +34822,10 @@ pub const Surface = struct {
         // includes one trace-path allocation per traced surface.
         self.noteBenchmarkMemoryStage(.surface_destroy_complete, null);
         self.memory_stage_trace.deinit(alloc);
+        // DestroyWindow still has messages to send after WM_DESTROY: a pane
+        // that kept the keyboard focus gets its WM_KILLFOCUS only then, once
+        // focus leaves the dying window. Those must not find this Surface.
+        if (own_hwnd) |handle| setWindowData(handle, null);
         alloc.destroy(self);
     }
 
