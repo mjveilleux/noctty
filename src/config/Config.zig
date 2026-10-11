@@ -3863,6 +3863,14 @@ test "writeConfigTemplate writes the template with its path" {
     try std.testing.expectEqualStrings(user_content, preserved);
 }
 
+test "the embedded config template has LF line endings in every checkout" {
+    // The template is embedded in the executable and written as the first-run
+    // config. `.gitattributes` pins it to LF; without that pin, a checkout with
+    // `core.autocrlf=true` (Git for Windows' default) builds CRLF bytes into
+    // the release binary, as v1.3.131's did.
+    try std.testing.expect(std.mem.indexOfScalar(u8, @embedFile("./config-template"), '\r') == null);
+}
+
 fn defaultConfigIsEmpty(path: []const u8) bool {
     const file = std.fs.openFileAbsolute(path, .{}) catch return false;
     defer file.close();

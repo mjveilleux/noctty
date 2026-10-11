@@ -342,6 +342,15 @@ Invoke-ContractTable -Contracts @(
         Description = 'every text file in the site payload and its source graph has a deterministic LF checkout rule'
     }
     @{
+        File = $siteGitattributes
+        Content = {
+            $siteGitattributesText
+        }
+        Pattern = '(?ms)^src/config/config-template text eol=lf\r?$.*?^src/config/testdata/\* text eol=lf\r?$.*?^src/shell-integration/\*\* text eol=lf\r?$.*?^src/font/res/\*\.bdf text eol=lf\r?$'
+        Kind = 'Text'
+        Description = 'the config template, the shell-integration scripts and the other text the build embeds or ships keep LF under core.autocrlf=true'
+    }
+    @{
         File = $siteAssetBuilder
         Content = {
             $siteAssetBuilderText

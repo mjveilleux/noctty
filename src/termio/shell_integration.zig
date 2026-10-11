@@ -2598,6 +2598,28 @@ test "zsh: missing resources" {
     try testing.expectEqual(0, env.count());
 }
 
+test "the shell-integration scripts have LF line endings in every checkout" {
+    // The release package ships these files as they are. `.gitattributes`
+    // pins them to LF; without that pin, a checkout with `core.autocrlf=true`
+    // (Git for Windows' default) ships CRLF, as v1.3.131 did, and a strict
+    // bash rejects the CR. The PowerShell script is pinned by `*.ps1`.
+    const scripts = .{
+        .{ "bash/ghostty.bash", @embedFile("../shell-integration/bash/ghostty.bash") },
+        .{ "cmd/clink.lua", @embedFile("../shell-integration/cmd/clink.lua") },
+        .{ "elvish/lib/ghostty-integration.elv", @embedFile("../shell-integration/elvish/lib/ghostty-integration.elv") },
+        .{ "fish/vendor_conf.d/ghostty-shell-integration.fish", @embedFile("../shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish") },
+        .{ "nushell/vendor/autoload/ghostty.nu", @embedFile("../shell-integration/nushell/vendor/autoload/ghostty.nu") },
+        .{ "zsh/.zshenv", @embedFile("../shell-integration/zsh/.zshenv") },
+        .{ "zsh/ghostty-integration", @embedFile("../shell-integration/zsh/ghostty-integration") },
+    };
+    inline for (scripts) |script| {
+        std.testing.expect(std.mem.indexOfScalar(u8, script[1], '\r') == null) catch |err| {
+            std.debug.print("CR in shell-integration/{s}\n", .{script[0]});
+            return err;
+        };
+    }
+}
+
 /// Test helper that creates a temporary resources directory with shell integration paths.
 const TmpResourcesDir = struct {
     allocator: Allocator,
