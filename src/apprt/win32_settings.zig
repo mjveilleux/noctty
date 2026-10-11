@@ -7218,6 +7218,39 @@ test "settings Escape without the close prompt closes a clean window and prompts
     }.body);
 }
 
+test "settings holds a quit for unsaved changes until Save or Discard closes the window" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const hwnd = fixture.hwnd();
+
+            // Nothing unsaved: the quit goes ahead.
+            try std.testing.expect(!settings.holdQuitForUnsavedChanges());
+            try std.testing.expect(!settings.close_prompt_visible);
+
+            // Unsaved: the close prompt holds the quit; Keep editing drops it.
+            settings.markRawScalarEdit(.font_size);
+            try std.testing.expect(settings.holdQuitForUnsavedChanges());
+            try std.testing.expect(settings.close_prompt_visible);
+            try std.testing.expect(fixture.pumpKey(0x1B));
+            try std.testing.expect(!settings.close_prompt_visible);
+            try std.testing.expect(!settings.takeQuitAfterClose());
+
+            // Discard closes the window and hands the quit back once.
+            try std.testing.expect(settings.holdQuitForUnsavedChanges());
+            settings.discardAndClose();
+            try std.testing.expect(settings.close_posted);
+            _ = SendMessageW(hwnd, WM_SETTINGS_CLOSE_NOW, 0, 0);
+            try std.testing.expectEqual(@as(u32, 1), fixture.closed);
+            try std.testing.expect(sys.IsWindow(hwnd) == 0);
+            try std.testing.expect(settings.takeQuitAfterClose());
+            try std.testing.expect(!settings.takeQuitAfterClose());
+        }
+    }.body);
+}
+
 test "settings Enter presses the focused push button and does nothing in a field" {
     try dialog_test.onHiddenDesktop(struct {
         fn body() !void {

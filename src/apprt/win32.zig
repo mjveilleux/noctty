@@ -37036,6 +37036,200 @@ test "win32 closeTab right no-op preserves redo and structural history" {
     try std.testing.expectEqual(@as(usize, 1), surface_b.undo_stack.redoDepth());
 }
 
+test "win32 window close asks first when a terminal would lose its process" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+
+    // A read-only core answers `needsConfirmQuit` before it reads the
+    // terminal, so the inert fixture core can stand in for a busy one.
+    surface_b.core_surface.readonly = true;
+    surface_b.core_initialized = true;
+    host.close();
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expectEqualStrings("Close this window?", host.confirm_payload.?.title);
+    try std.testing.expectEqualStrings(
+        "A process is still running in this window. Closing the window will terminate it.",
+        host.confirm_payload.?.body,
+    );
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+
+    // Cancel leaves the window as it was.
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+
+    // Nothing to lose, or a sign-out: no prompt.
+    host.close();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    app.session_ending = true;
+    surface_b.core_initialized = true;
+    host.close();
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+}
+
+test "win32 close other tabs asks first and keeps history until Close" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .register = true, .active_tab = 1 }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+            .{ .host = &host, .surface = &surface_c, .id = 3 },
+        },
+    });
+    defer session.deinit();
+    try host.structural_undo_entries.append(std.testing.allocator, .{
+        .kind = .close_tab,
+        .timestamp_ms = 10,
+        .payload = .{ .close_tab = .{ .tab = null, .index = 3, .tab_id = 4 } },
+    });
+
+    // Only the tab to the left is busy: closing the tabs to the right of
+    // tab 2 has nothing to ask about.
+    surface_a.core_surface.readonly = true;
+    surface_a.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.app, .right));
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
+
+    try host.structural_undo_entries.append(std.testing.allocator, .{
+        .kind = .close_tab,
+        .timestamp_ms = 20,
+        .payload = .{ .close_tab = .{ .tab = null, .index = 3, .tab_id = 4 } },
+    });
+    try std.testing.expect(try app.closeTab(.app, .other));
+    surface_a.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host.overlay_mode);
+    try std.testing.expectEqualStrings("Close the other tabs?", host.confirm_payload.?.title);
+    // Not closed yet, so not cleared yet: Cancel must leave undo intact.
+    try std.testing.expectEqual(@as(usize, 1), host.structural_undo_entries.items.len);
+    host.invokeConfirmCancel();
+    try std.testing.expectEqual(@as(usize, 1), host.structural_undo_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 3), host.tabs.items.len);
+
+    surface_a.core_initialized = true;
+    try std.testing.expect(try app.closeTab(.app, .other));
+    surface_a.core_initialized = false;
+    host.invokeConfirmAccept();
+    try std.testing.expectEqual(HostOverlayMode.none, host.overlay_mode);
+    try std.testing.expectEqual(@as(usize, 0), host.structural_undo_entries.items.len);
+}
+
+test "win32 quit asks once on the window it came from" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host_a: Host = undefined;
+    var host_b: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host_a, .id = 1, .register = true },
+            .{ .storage = &host_b, .id = 2, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host_a, .register = true },
+            .{ .storage = &surface_b, .host = &host_b, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host_a, .surface = &surface_a, .id = 1 },
+            .{ .host = &host_b, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    app.running = true;
+
+    // The busy terminal is in the other window; the prompt still shows
+    // where the quit came from.
+    surface_b.core_surface.readonly = true;
+    surface_b.core_initialized = true;
+    try std.testing.expect(try app.performAction(.{ .surface = surface_a.core() }, .quit, {}));
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
+    try std.testing.expectEqual(HostOverlayMode.none, host_b.overlay_mode);
+    try std.testing.expectEqualStrings("Quit noctty?", host_a.confirm_payload.?.title);
+    try std.testing.expect(app.running);
+    host_a.invokeConfirmCancel();
+
+    // `close_all_windows` quits too, and asks the same way; with no window
+    // named, the first window asks.
+    try std.testing.expect(try app.performAction(.app, .close_all_windows, {}));
+    surface_b.core_initialized = false;
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
+    try std.testing.expect(app.running);
+    try std.testing.expectEqual(@as(usize, 2), app.hosts.items.len);
+    host_a.invokeConfirmCancel();
+
+    // Save or Discard in a Settings prompt that a quit raised resumes it,
+    // on the window Settings hands focus back to.
+    app.settings_window.quit_after_close = true;
+    surface_b.core_initialized = true;
+    settingsOnClosedThunk(@ptrCast(&app));
+    surface_b.core_initialized = false;
+    try std.testing.expect(!app.settings_window.quit_after_close);
+    try std.testing.expectEqual(HostOverlayMode.confirm, host_a.overlay_mode);
+    host_a.invokeConfirmCancel();
+    try std.testing.expect(app.running);
+}
+
+test "win32 close prompts count the terminals they would end" {
+    var buf: [256]u8 = undefined;
+    const one = closeScopePrompt(.right_tabs, 1, &buf);
+    try std.testing.expectEqualStrings("Close the tabs to the right?", one.title);
+    try std.testing.expectEqualStrings("Close tabs", one.accept_label);
+    try std.testing.expectEqualStrings(
+        "A process is still running in a tab to the right. Closing those tabs will terminate it.",
+        one.body,
+    );
+    const many = closeScopePrompt(.app, 3, &buf);
+    try std.testing.expectEqualStrings("Quit", many.accept_label);
+    try std.testing.expectEqualStrings(
+        "Processes are still running in 3 terminals. Quitting noctty will terminate them.",
+        many.body,
+    );
+}
+
 test "win32 closeTab this on last tab detaches tab for undo" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
