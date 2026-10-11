@@ -552,8 +552,8 @@ const StatusNote = enum {
     save_failed,
     /// The config file is UTF-16 or UTF-32 text that a save cannot patch.
     unsupported_encoding,
-    /// The config file was edited since Settings last read it.
-    changed_on_disk,
+    /// The config path is a link whose target is missing.
+    dangling_link,
     close_failed,
     resolve_first,
     conflict_not_resolved,
@@ -569,8 +569,8 @@ const StatusNote = enum {
             .saved => "Settings saved.",
             .saved_overridden => "Saved, but a later config file or command-line option overrides some of these values, so they will not take effect.",
             .save_failed => "Save failed. Your edits are kept. Check that the config file can be written and is not open in another program, then try again.",
-            .unsupported_encoding => "Nothing was saved: the config file is not UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.",
-            .changed_on_disk => "The config file changed on disk. Review the values, then save again. Your edits are kept.",
+            .unsupported_encoding => "Nothing was saved: the config file is not readable as UTF-8 text (Windows PowerShell 5.1 writes UTF-16). Save it as UTF-8 in an editor, then save again. Your edits are kept.",
+            .dangling_link => "Nothing was saved: the config file is a link to a file that does not exist. Fix or remove the link, then save again. Your edits are kept.",
             .close_failed => "Could not close the settings window; your edits are kept.",
             .resolve_first => "Fix the invalid fields or choose Keep mine or Use disk before saving.",
             .conflict_not_resolved => "Could not resolve the conflict; your edit is kept.",
@@ -1306,6 +1306,9 @@ fn labelIndexIsCheckbox(index: usize) bool {
 /// edits.
 pub const SaveError = error{
     PathResolveFailed,
+    /// The config path is a link to a file that does not exist. Writing would
+    /// replace the link, so nothing is written.
+    DanglingLink,
     TempCreateFailed,
     SerializeFailed,
     ReplaceFailed,
@@ -1331,11 +1334,12 @@ pub const SaveReloadOutcome = union(enum) {
 };
 
 /// What the status line says about a save that wrote nothing. Most failures
-/// share one hint (the file cannot be written); a file in the wrong encoding is
-/// something the user can fix, so it is named.
+/// share one hint (the file cannot be written); a file in the wrong encoding
+/// and a link to nowhere are something the user can fix, so they are named.
 fn saveFailureNote(err: SaveError) StatusNote {
     return switch (err) {
         error.UnsupportedEncoding => .unsupported_encoding,
+        error.DanglingLink => .dangling_link,
         else => .save_failed,
     };
 }
@@ -1499,12 +1503,13 @@ pub const AppHandle = struct {
     /// `resolveConflict` is called with keep-mine or use-disk.
     notifyConflict: ?*const fn (ctx: *anyopaque, field: SettingField) void = null,
     /// Optional. Asked before a save writes anything: the file may have been
-    /// edited since this window last read it, with no reload to say so.
-    /// Returns true when it found an edit to a setting that is also being
-    /// edited here, after applying the file as a reload does, so that
-    /// `externalConfigChanged` has flagged what overlaps. A save that wrote
-    /// over such an edit would lose it without a word.
-    reconcileDisk: ?*const fn (ctx: *anyopaque, pending: *const Config, original: *const Config) bool = null,
+    /// edited since this window last read it, with no reload to say so. When
+    /// it finds an edit to a setting that is also being edited here, it applies
+    /// the file as a reload does, so `externalConfigChanged` flags what
+    /// overlaps and the save stops at the conflict. A save that wrote over such
+    /// an edit would lose it without a word. An error means the file could not
+    /// be checked, and nothing is saved.
+    reconcileDisk: ?*const fn (ctx: *anyopaque, pending: *const Config, original: *const Config) SaveError!void = null,
     /// Optional asynchronous two-phase persistence hook. The receiver must
     /// eventually call `SettingsWindow.completeSave` with the same `apply_id`.
     /// When absent, `saveAndReload` remains the synchronous compatibility path.
@@ -1997,7 +2002,7 @@ pub const SettingsWindow = struct {
             // These are about edits that are still there to be saved.
             .save_failed,
             .unsupported_encoding,
-            .changed_on_disk,
+            .dangling_link,
             .close_failed,
             .resolve_first,
             .conflict_not_resolved,
@@ -4097,18 +4102,20 @@ pub const SettingsWindow = struct {
             self.ensureControlVisible(control);
             return;
         }
-        if (self.conflictCount() != 0) {
-            self.surfaceNextValidation(false);
-            return;
-        }
         // The check may merge a changed file into this window, so it runs on
-        // the window's own configs and nothing below uses a copy made before it.
-        if (self.handle.reconcileDisk) |reconcile| {
-            if (self.pending) |*draft| if (self.original) |*baseline| if (reconcile(self.handle.ctx, draft, baseline)) {
-                if (self.conflictCount() != 0) self.surfaceNextValidation(false) else self.setNote(.changed_on_disk);
+        // the window's own configs, and nothing below uses a copy made before
+        // it. A conflict it finds is shown the way one that was already open is.
+        if (self.conflictCount() == 0) if (self.handle.reconcileDisk) |reconcile| {
+            if (self.pending) |*draft| if (self.original) |*baseline| reconcile(self.handle.ctx, draft, baseline) catch |err| {
+                std.log.warn("settings: could not check the config file before saving err={}; draft preserved", .{err});
+                self.setNote(saveFailureNote(err));
                 self.updateSaveEnabled();
                 return;
             };
+        };
+        if (self.conflictCount() != 0) {
+            self.surfaceNextValidation(false);
+            return;
         }
         const p = self.pending orelse return;
         const o = self.original orelse return;
@@ -5727,6 +5734,8 @@ test "settings save checks the file for edits first, and a conflict stops it" {
         /// What the file now holds for the font size; null means it still
         /// holds what this session started from.
         disk_font_size: ?f32 = null,
+        /// The file cannot be checked.
+        fail: bool = false,
         settings: *SettingsWindow = undefined,
         fn save(ctx: *anyopaque, _: *const Config, _: *const Config) SaveError!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -5735,16 +5744,16 @@ test "settings save checks the file for edits first, and a conflict stops it" {
             // fake a config reload.
             return error.SerializeFailed;
         }
-        fn reconcile(ctx: *anyopaque, _: *const Config, _: *const Config) bool {
+        fn reconcile(ctx: *anyopaque, _: *const Config, _: *const Config) SaveError!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.asked += 1;
-            const size = self.disk_font_size orelse return false;
+            if (self.fail) return error.ReloadFailed;
+            const size = self.disk_font_size orelse return;
             // What the app does on finding a changed file: apply it as a reload.
-            var disk = Config.default(std.testing.allocator) catch return false;
+            var disk = Config.default(std.testing.allocator) catch return error.OutOfMemory;
             defer disk.deinit();
             disk.@"font-size" = size;
             self.settings.externalConfigChanged(&disk, 100);
-            return true;
         }
     };
     const edit = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 1, 1, null, null, null, null) orelse return error.Unexpected;
@@ -5785,6 +5794,7 @@ test "settings save checks the file for edits first, and a conflict stops it" {
     // While a conflict is open the save does not even read the file again.
     settings.save();
     try std.testing.expectEqual(@as(u32, 2), capture.asked);
+    try std.testing.expectEqual(@as(u32, 1), capture.saved);
 
     // Keep mine adopts the file's value as the baseline; the next save
     // writes the draft.
@@ -5795,6 +5805,16 @@ test "settings save checks the file for edits first, and a conflict stops it" {
     try std.testing.expectEqual(@as(u32, 3), capture.asked);
     try std.testing.expectEqual(@as(u32, 2), capture.saved);
     try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
+
+    // A file that cannot be checked is not written over blind: nothing is
+    // saved, the draft stays and the status says the save failed.
+    capture.fail = true;
+    settings.status_note = .none;
+    settings.save();
+    try std.testing.expectEqual(@as(u32, 4), capture.asked);
+    try std.testing.expectEqual(@as(u32, 2), capture.saved);
+    try std.testing.expectEqual(StatusNote.save_failed, settings.status_note);
+    try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
 }
 
 test "settings without a disk check save as before, and a failed save names an unusable encoding" {
@@ -5802,12 +5822,14 @@ test "settings without a disk check save as before, and a failed save names an u
     try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.ReplaceFailed));
     try std.testing.expectEqual(StatusNote.save_failed, saveFailureNote(error.PathResolveFailed));
     try std.testing.expectEqual(StatusNote.unsupported_encoding, saveFailureNote(error.UnsupportedEncoding));
-    // The note tells the person what to do, in words, and is held while the
-    // edits it is about are still there.
-    const text = StatusNote.unsupported_encoding.text();
-    try std.testing.expect(std.mem.indexOf(u8, text, "UTF-8") != null);
-    try expectNoInternalSyntax(text);
-    try expectNoInternalSyntax(StatusNote.changed_on_disk.text());
+    try std.testing.expectEqual(StatusNote.dangling_link, saveFailureNote(error.DanglingLink));
+    // Each note tells the person what to do, in words.
+    const encoding = StatusNote.unsupported_encoding.text();
+    try std.testing.expect(std.mem.indexOf(u8, encoding, "UTF-8") != null);
+    try expectNoInternalSyntax(encoding);
+    const link = StatusNote.dangling_link.text();
+    try std.testing.expect(std.mem.indexOf(u8, link, "link") != null);
+    try expectNoInternalSyntax(link);
 }
 
 fn stubChromeBg(_: *anyopaque) COLORREF {
@@ -8152,8 +8174,8 @@ test "settings scrollback label states the unit, that 0 turns scrollback off, an
     for ([_][]const u8{ "rows", "unlimited" }) |claim| {
         try std.testing.expect(std.mem.indexOf(u8, scrollback_label, claim) == null);
     }
-    // The accessible name is the visible label's first words, so a screen
-    // reader user hears what the sighted user reads.
+    // The accessible name stays the visible label's first words (the UIA
+    // harness finds the field by it).
     try std.testing.expect(std.mem.startsWith(u8, scrollback_label, settings_control_specs[0].name));
     try std.testing.expect(std.mem.startsWith(u8, scrollback_label, SettingField.scrollback_limit.label()));
 }

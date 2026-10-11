@@ -3106,16 +3106,29 @@ fn settingsEditedValueMasked(
 /// someone else changed what the user is changing. A file that agrees with the
 /// draft lost nothing, and one that agrees with `original` holds only the
 /// user's own edit to come.
+///
+/// `original` is a clone of the app's config, which has the app's conditional
+/// state applied (a dark system picks the dark half of a `light:A,dark:B`
+/// theme, and that theme can set editable keys), so the file is judged with
+/// the same state applied. Raw, an untouched file would differ from
+/// `original` for those keys and every Save would stop.
 fn settingsDiskEditConflict(
     original: *const configpkg.Config,
     pending: *const configpkg.Config,
     disk: *const configpkg.Config,
+    state: configpkg.ConditionalState,
     user_edited: SettingsEditedKeySet,
 ) bool {
+    var applied: ?configpkg.Config = disk.changeConditionalState(state) catch |err| blk: {
+        log.warn("settings save: could not apply the conditional state to the config file err={}", .{err});
+        break :blk null;
+    };
+    defer if (applied) |*config| config.deinit();
+    const effective: *const configpkg.Config = if (applied) |*config| config else disk;
     inline for (win32_settings.editable_keys) |key| {
         if (user_edited.isSet(@intFromEnum(key)) and
-            settingsDiskValueDiffers(original, disk, key) and
-            settingsDiskValueDiffers(pending, disk, key)) return true;
+            settingsDiskValueDiffers(original, effective, key) and
+            settingsDiskValueDiffers(pending, effective, key)) return true;
     }
     return false;
 }
@@ -10678,26 +10691,30 @@ pub const App = struct {
     ///
     /// The file is read exactly as a reload reads it, and judged by the
     /// effective values, which is how the window itself decides what is a
-    /// conflict (`externalConfigChanged`); an edit to an included file or to
-    /// another setting is not one. When there is one, the file is applied as
-    /// a reload applies it, which hands the window the conflict to resolve
-    /// (Keep mine or Use disk), and this returns true: nothing is saved.
-    fn settingsReconcileDisk(self: *App, pending: *const configpkg.Config, original: *const configpkg.Config) bool {
+    /// conflict (`externalConfigChanged`); an edit to an included file counts,
+    /// an edit to another setting does not. When there is one, the file is
+    /// applied as a reload applies it, which hands the window the conflict to
+    /// resolve (Keep mine or Use disk); the window then stops the save. If the
+    /// file cannot be read or applied, nothing is saved either: the save would
+    /// write blind.
+    fn settingsReconcileDisk(
+        self: *App,
+        pending: *const configpkg.Config,
+        original: *const configpkg.Config,
+    ) win32_settings.SaveError!void {
         const user_edited = settingsUserEditedKeys(original, pending);
-        if (user_edited.count() == 0) return false;
-        // A file that cannot be read now is the save's own error to report.
+        if (user_edited.count() == 0) return;
         var disk = self.loadConfigAtStartupCwd() catch |err| {
             log.warn("settings save: could not read the config file to check it for edits err={}", .{err});
-            return false;
+            return error.ReloadFailed;
         };
         defer disk.deinit();
-        if (!settingsDiskEditConflict(original, pending, &disk, user_edited)) return false;
+        if (!settingsDiskEditConflict(original, pending, &disk, self.core_app.config_conditional_state, user_edited)) return;
         log.info("settings save: the config file changed on disk under an edited setting; offering the choice", .{});
         self.core_app.updateConfig(self, &disk) catch |err| {
             log.warn("settings save: applying the changed config file failed err={}", .{err});
-            return false;
+            return error.ReloadFailed;
         };
-        return true;
     }
 
     /// The legacy `ShellExecuteW` path. Kept alive for Advanced pane
@@ -24302,7 +24319,7 @@ fn settingsReconcileDiskThunk(
     ctx: *anyopaque,
     pending: *const configpkg.Config,
     original: *const configpkg.Config,
-) bool {
+) win32_settings.SaveError!void {
     const app: *App = @ptrCast(@alignCast(ctx));
     return app.settingsReconcileDisk(pending, original);
 }
@@ -25039,10 +25056,7 @@ fn persistSettings(
     // A config kept behind a link is edited where it lives, so the link
     // survives and a dotfiles repository sees the change. A dangling link is
     // refused: there is no file to patch, and writing would replace the link.
-    const target = save_target.resolve(alloc, config_path) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.DanglingLink, error.ResolveFailed => return error.PathResolveFailed,
-    };
+    const target = try save_target.resolve(alloc, config_path);
     defer target.deinit(alloc);
 
     // SURGICAL SAVE: read the raw target file text and patch
@@ -25200,6 +25214,7 @@ test "win32 settings automatic command is not masked by default resolution" {
 
 test "win32 settings disk edit is a conflict only for an edited setting the file now says differently" {
     const alloc = std.testing.allocator;
+    const light: configpkg.ConditionalState = .{};
     var original = try configpkg.Config.default(alloc);
     defer original.deinit();
     var pending = try original.clone(alloc);
@@ -25211,24 +25226,77 @@ test "win32 settings disk edit is a conflict only for an edited setting the file
     defer disk.deinit();
 
     // The file is as the session found it: only the user's edit is new.
-    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, edited));
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, light, edited));
     // Someone set the same setting to something else.
     disk.@"font-size" = 16;
-    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &disk, edited));
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &disk, light, edited));
     // ... unless it is the value the user is setting: nothing would be lost.
     disk.@"font-size" = 14;
-    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, edited));
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, light, edited));
     // An edit to a setting the user is not changing is merged by the save and
     // applied by its reload, not a conflict.
     disk.@"font-size" = 12;
     disk.@"copy-on-select" = .true;
-    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, edited));
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, light, edited));
     // Nothing edited, nothing to lose.
-    try std.testing.expect(!settingsDiskEditConflict(&original, &original, &disk, settingsUserEditedKeys(&original, &original)));
+    try std.testing.expect(!settingsDiskEditConflict(&original, &original, &disk, light, settingsUserEditedKeys(&original, &original)));
+}
+
+test "win32 settings disk edit judges the file with the app's conditional state applied" {
+    // On a dark system the app holds the dark half of `theme = light:A,dark:B`,
+    // and a theme can set editable keys. The file as loaded has the light half,
+    // so an untouched file differed from the window's snapshot, and every Save
+    // stopped at a conflict that could never be resolved.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "light.theme", .data = "cursor-style = underline\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "dark.theme", .data = "cursor-style = block_hollow\n" });
+    const light_path = try tmp.dir.realpathAlloc(alloc, "light.theme");
+    defer alloc.free(light_path);
+    const dark_path = try tmp.dir.realpathAlloc(alloc, "dark.theme");
+    defer alloc.free(dark_path);
+    const text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\n", .{ light_path, dark_path });
+    defer alloc.free(text);
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = text });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+
+    var disk = try configpkg.Config.default(alloc);
+    defer disk.deinit();
+    try disk.loadFile(alloc, path);
+    try disk.finalize();
+    const dark: configpkg.ConditionalState = .{ .theme = .dark };
+    var app_config = (try disk.changeConditionalState(dark)).?;
+    defer app_config.deinit();
+    try std.testing.expect(disk.@"cursor-style" != app_config.@"cursor-style");
+
+    // The window's snapshots are the app's config.
+    var original = try app_config.clone(alloc);
+    defer original.deinit();
+    var pending = try original.clone(alloc);
+    defer pending.deinit();
+    pending.@"cursor-style" = .bar;
+    const edited = settingsUserEditedKeys(&original, &pending);
+    try std.testing.expect(edited.isSet(@intFromEnum(SettingsConfigKey.@"cursor-style")));
+
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &disk, dark, edited));
+
+    // A real edit under the same state is still found: the file now sets the
+    // key itself, over the theme.
+    const edited_text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\ncursor-style = block\n", .{ light_path, dark_path });
+    defer alloc.free(edited_text);
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = edited_text });
+    var changed = try configpkg.Config.default(alloc);
+    defer changed.deinit();
+    try changed.loadFile(alloc, path);
+    try changed.finalize();
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &changed, dark, edited));
 }
 
 test "win32 settings disk edit does not mistake the resolved default command for an edit" {
     const alloc = std.testing.allocator;
+    const light: configpkg.ConditionalState = .{};
     // The window keeps a command nobody set as automatic (null); the load
     // fills in the shell it found.
     var original = try configpkg.Config.default(alloc);
@@ -25243,13 +25311,13 @@ test "win32 settings disk edit does not mistake the resolved default command for
     defer resolved.deinit();
     try resolved.resolveWindowsDefaultCommand();
     try std.testing.expect(resolved.command != null and resolved._command_defaulted);
-    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &resolved, edited));
+    try std.testing.expect(!settingsDiskEditConflict(&original, &pending, &resolved, light, edited));
 
     // A command written in the file is another matter.
     var written = try original.clone(alloc);
     defer written.deinit();
     written.command = .{ .shell = "cmd" };
-    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &written, edited));
+    try std.testing.expect(settingsDiskEditConflict(&original, &pending, &written, light, edited));
 }
 
 test "win32 settings save target stops at the child command boundary" {
@@ -25396,7 +25464,7 @@ test "win32 settings save refuses a dangling link and leaves it alone" {
     var draft = try settingsTestCopyOnSelectEdit(alloc);
     defer draft.pending.deinit();
 
-    try std.testing.expectError(error.PathResolveFailed, persistSettings(alloc, link, &draft.pending, draft.edited));
+    try std.testing.expectError(error.DanglingLink, persistSettings(alloc, link, &draft.pending, draft.edited));
     try std.testing.expect(try scratch.isLink("config.ghostty"));
     try scratch.expectNames(&.{"config.ghostty"});
 }

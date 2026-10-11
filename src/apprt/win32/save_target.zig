@@ -12,6 +12,8 @@ const Allocator = std.mem.Allocator;
 const sys = @import("sys.zig");
 const c = @import("consts.zig");
 
+const log = std.log.scoped(.save_target);
+
 extern "kernel32" fn GetFinalPathNameByHandleW(
     handle: windows.HANDLE,
     path: [*]u16,
@@ -42,7 +44,6 @@ pub const ResolveError = error{
     /// The name is a link whose target is missing. Writing "to" it would
     /// replace the link, which is what resolving exists to avoid.
     DanglingLink,
-    ResolveFailed,
 } || Allocator.Error;
 
 pub const WriteError = error{
@@ -52,9 +53,12 @@ pub const WriteError = error{
 } || Allocator.Error;
 
 /// Follow `path` to the file it names. A name with no file behind it is the
-/// first save and resolves to itself.
+/// first save and resolves to itself. What cannot be learned (a volume that
+/// does not answer the final-path query, a name that is not valid text) leaves
+/// the name as it was: the read and the write that follow report the real
+/// problem, as they did before links were followed.
 pub fn resolve(alloc: Allocator, path: []const u8) ResolveError!Target {
-    const wide = windows.sliceToPrefixedFileW(null, path) catch return error.ResolveFailed;
+    const wide = windows.sliceToPrefixedFileW(null, path) catch return named(alloc, path);
     // No access is asked for, so a read-only or busy file still opens; the
     // handle only answers questions about the file.
     const handle = windows.kernel32.CreateFileW(
@@ -74,34 +78,43 @@ pub fn resolve(alloc: Allocator, path: []const u8) ResolveError!Target {
             const attributes = windows.kernel32.GetFileAttributesW(wide.span().ptr);
             if (attributes != windows.INVALID_FILE_ATTRIBUTES and
                 attributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0) return error.DanglingLink;
-            return .{ .path = try alloc.dupe(u8, path) };
+            return named(alloc, path);
         },
-        else => return error.ResolveFailed,
+        else => return named(alloc, path),
     };
     defer windows.CloseHandle(handle);
 
     var info: windows.BY_HANDLE_FILE_INFORMATION = undefined;
-    if (GetFileInformationByHandle(handle, &info) == 0) return error.ResolveFailed;
+    const hard_linked = GetFileInformationByHandle(handle, &info) != 0 and info.nNumberOfLinks > 1;
+    const final = finalPath(alloc, handle) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unresolved => return .{ .path = try alloc.dupe(u8, path), .hard_linked = hard_linked },
+    };
+    return .{ .path = final, .hard_linked = hard_linked };
+}
 
+fn named(alloc: Allocator, path: []const u8) Allocator.Error!Target {
+    return .{ .path = try alloc.dupe(u8, path) };
+}
+
+/// The path of the file `handle` is open on, as `plain` writes it. Owned.
+fn finalPath(alloc: Allocator, handle: windows.HANDLE) error{ OutOfMemory, Unresolved }![]u8 {
     var storage = try alloc.alloc(u16, 512);
     defer alloc.free(storage);
     const final = while (true) {
         // Success is the length without the terminator; a buffer that is too
         // small gets the length it needs, terminator included.
         const length = GetFinalPathNameByHandleW(handle, storage.ptr, @intCast(storage.len), 0);
-        if (length == 0) return error.ResolveFailed;
+        if (length == 0) return error.Unresolved;
         if (length < storage.len) break storage[0..length];
         storage = try alloc.realloc(storage, length);
     };
     const name = std.unicode.utf16LeToUtf8Alloc(alloc, final) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.ResolveFailed,
+        else => return error.Unresolved, // A name with a lone surrogate is not text the program can pass on.
     };
     defer alloc.free(name);
-    return .{
-        .path = try alloc.dupe(u8, plain(name)),
-        .hard_linked = info.nNumberOfLinks > 1,
-    };
+    return alloc.dupe(u8, plain(name));
 }
 
 /// The final-path API answers in the `\\?\` namespace; every other path in the
@@ -156,12 +169,16 @@ pub fn write(alloc: Allocator, target: Target, bytes: []const u8) WriteError!voi
     }
 
     if (target.hard_linked) {
-        // Opening truncates. A file that cannot be opened is untouched, so the
-        // copy goes with it; from here on the copy is the only complete one.
-        const file = std.fs.cwd().createFile(target.path, .{}) catch return error.ReplaceFailed;
+        // Opened without truncating, which also works for a hidden or system
+        // file (creating over one fails). A file that cannot be opened is
+        // untouched, so the copy goes with it; from the first byte on the copy
+        // is the only complete one, and the log says where it is.
+        const file = std.fs.cwd().openFile(target.path, .{ .mode = .write_only }) catch return error.ReplaceFailed;
         defer file.close();
         temp_pending = false;
+        errdefer log.warn("rewriting {s} in place failed; the complete new text is in {s}", .{ target.path, tmp_path });
         file.writeAll(bytes) catch return error.SerializeFailed;
+        file.setEndPos(bytes.len) catch return error.SerializeFailed;
         file.sync() catch return error.SerializeFailed;
         std.fs.cwd().deleteFile(tmp_path) catch {}; // The rewrite finished: the copy is no longer needed.
         return;
@@ -408,6 +425,28 @@ test "save target keeps a hard-linked file that cannot be opened as it was, with
     try testing.expect(target.hard_linked);
     try testing.expectError(error.ReplaceFailed, write(testing.allocator, target, "new\n"));
     try scratch.expectContent("config.ghostty", "old\n");
+    try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
+}
+
+test "save target rewrites a hidden hard-linked file in place" {
+    // Creating over a hidden file fails with access denied; opening it does not.
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try scratch.tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "old and longer than the new text\n" });
+    try scratch.hardlink("dotfile", "config.ghostty");
+    const path = try scratch.path("config.ghostty");
+    defer testing.allocator.free(path);
+    const path_w = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, path);
+    defer testing.allocator.free(path_w);
+    try testing.expect(SetFileAttributesW(path_w, windows.FILE_ATTRIBUTE_HIDDEN) != 0);
+    defer _ = SetFileAttributesW(path_w, windows.FILE_ATTRIBUTE_NORMAL);
+
+    const target = try resolve(testing.allocator, path);
+    defer target.deinit(testing.allocator);
+    try testing.expect(target.hard_linked);
+    try write(testing.allocator, target, "new\n");
+    try scratch.expectContent("config.ghostty", "new\n");
+    try scratch.expectContent("dotfile", "new\n");
     try scratch.expectNames(&.{ "config.ghostty", "dotfile" });
 }
 
