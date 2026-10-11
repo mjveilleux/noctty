@@ -6714,7 +6714,7 @@ pub const App = struct {
     ) !bool {
         switch (action) {
             .quit => {
-                self.requestQuit(self.undoRedoSurfaceForTarget(target));
+                self.postQuit(target);
                 return true;
             },
 
@@ -6907,7 +6907,7 @@ pub const App = struct {
 
             .close_all_windows => {
                 // Closing every window quits, as `quit` does.
-                self.requestQuit(self.undoRedoSurfaceForTarget(target));
+                self.postQuit(target);
                 return true;
             },
 
@@ -9925,6 +9925,22 @@ pub const App = struct {
         defer self.core_app.alloc.free(osk_w);
         const result = sys.ShellExecuteW(null, shell_open, osk_w.ptr, null, null, c.SW_SHOW);
         if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
+    }
+
+    /// `quit` and `close_all_windows` run from the message loop, through the
+    /// target's window. Core does not count either as a closing action
+    /// (`closingAction`) and goes on using the terminal whose key binding
+    /// asked for it, so destroying the windows from inside that call freed
+    /// the terminal under its own key handler: an access violation in
+    /// `endKeySequence` in Debug builds.
+    fn postQuit(self: *App, target: apprt.Target) void {
+        const near = self.undoRedoSurfaceForTarget(target);
+        const host = if (near) |surface| surface.host else null;
+        const post_host = host orelse if (self.hosts.items.len > 0) self.hosts.items[0] else null;
+        if (post_host) |candidate| if (candidate.hwnd) |hwnd| {
+            if (sys.PostMessageW(hwnd, c.WM_WINHOSTTY_QUIT, 0, 0) != 0) return;
+        };
+        self.requestQuit(near);
     }
 
     /// `quit` and `close_all_windows`. Unsaved Settings edits ask first, in
@@ -28317,6 +28333,11 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
         },
         c.WM_WINHOSTTY_SESSION_CHECKPOINT => {
             if (host) |v| v.app.checkpointSessionState();
+            return 0;
+        },
+        c.WM_WINHOSTTY_QUIT => {
+            // May destroy this window: nothing after the call reads `v`.
+            if (host) |v| v.app.requestQuit(v.activeSurface());
             return 0;
         },
 

@@ -36,7 +36,9 @@ $exePath = Get-InteractiveWin11ExePath -RepoRoot $repoRoot
 $buildInputs = Get-InteractiveWin11DefaultBuildInputs -RepoRoot $repoRoot
 $launchAction = Get-InteractiveWin11LaunchAction -ExePath $exePath -Rebuild:$Rebuild -BuildInputs $buildInputs
 
-$launchArgs = @(Get-InteractiveWin11LaunchArguments -Layout $layout)
+# WM_CLOSE follows startup closely, possibly before the shell's first prompt,
+# and a window whose terminal is not at a prompt asks before closing.
+$launchArgs = @(Get-InteractiveWin11LaunchArguments -Layout $layout) + @('--confirm-close-surface=false')
 $stdoutPath = Join-Path $layout.Logs 'interactive-win11-smoke-stdout.log'
 $stderrPath = Join-Path $layout.Logs 'interactive-win11-smoke-stderr.log'
 

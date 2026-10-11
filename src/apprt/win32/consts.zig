@@ -160,6 +160,8 @@ pub const WM_WINHOSTTY_RENDER_TRACE_TARGET = WM_APP + 9;
 pub const WM_WINHOSTTY_UIA_CAPTION_SYNC = WM_APP + 10;
 /// Save the session from the message loop (see WM_DISPLAYCHANGE).
 pub const WM_WINHOSTTY_SESSION_CHECKPOINT = WM_APP + 11;
+/// Quit from the message loop (see `App.postQuit`).
+pub const WM_WINHOSTTY_QUIT = WM_APP + 12;
 
 pub const PM_NOREMOVE: UINT = 0x0000;
 pub const PM_REMOVE: UINT = 0x0001;
