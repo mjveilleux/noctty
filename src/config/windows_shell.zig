@@ -1562,13 +1562,44 @@ fn normalizeWslPath(alloc: Allocator, path: []const u8) ![]const u8 {
 }
 
 fn uriPathToWindows(alloc: Allocator, path: []const u8) ![]const u8 {
+    return try drivePathToWindows(alloc, path[1], path[3..]);
+}
+
+/// `rest` is what follows the `X:` and its first separator.
+fn drivePathToWindows(alloc: Allocator, drive: u8, rest: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try buf.append(alloc, path[1]);
+    try buf.append(alloc, drive);
     try buf.appendSlice(alloc, ":\\");
-    try appendWindowsPath(&buf, alloc, trimLeadingSeparators(path[3..]));
+    try appendWindowsPath(&buf, alloc, trimLeadingSeparators(rest));
     return try buf.toOwnedSlice(alloc);
+}
+
+/// The Windows path in the plain form of ConEmu's OSC 9;9: `C:\Users\me`,
+/// `C:/Users/me`, or either in one pair of double quotes, as oh-my-posh's
+/// `osc99` and nushell send it. Returns null for anything else, which the
+/// caller then reads as a URL (noctty's cmd integration sends
+/// `kitty-shell-cwd://localhost/%P`).
+///
+/// Only a drive-absolute path qualifies, plus the WSL form: `wslpath -w`, the
+/// recipe Windows Terminal documents for WSL, prints `\\wsl.localhost\Ubuntu\home\me`,
+/// which maps to the distro's own `/home/me` exactly as it does in an OSC 7
+/// URL (`osc7PathToLocal`). Any other UNC path, a device path and a relative
+/// path are not taken. The result is not checked for control bytes or a
+/// network shape; `isSafeWindowsPath` and `os.path.isNetworkOrDevicePath` do
+/// that.
+pub fn conemuPathToLocal(alloc: Allocator, value: []const u8) !?[]const u8 {
+    var path = value;
+    if (path.len >= 2 and path[0] == '"' and path[path.len - 1] == '"') {
+        path = path[1 .. path.len - 1];
+    }
+    // A quote left over is not part of any Windows path.
+    if (std.mem.indexOfScalar(u8, path, '"') != null) return null;
+    if (isDriveAbsolutePath(path)) return try drivePathToWindows(alloc, path[0], path[3..]);
+    if (std.mem.startsWith(u8, path, "\\\\wsl.localhost\\") or
+        std.mem.startsWith(u8, path, "\\\\wsl$\\")) return try normalizeWslPath(alloc, path);
+    return null;
 }
 
 fn appendNormalizedPath(
@@ -2016,6 +2047,75 @@ test "osc7PathToLocal converts windows file uri path" {
     defer alloc.free(result);
 
     try testing.expectEqualStrings("C:\\Users\\aman\\src", result);
+}
+
+test "conemuPathToLocal reads the plain path of OSC 9;9" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "C:\\Users\\aman\\src", "C:\\Users\\aman\\src" },
+        // oh-my-posh quotes the path.
+        .{ "\"C:\\Users\\aman\\src\"", "C:\\Users\\aman\\src" },
+        // A path with spaces needs no quotes of its own.
+        .{ "C:\\Program Files\\Git", "C:\\Program Files\\Git" },
+        // A forward slash is the other separator, and the letter keeps its case.
+        .{ "d:/work/noctty", "d:\\work\\noctty" },
+        .{ "C:\\", "C:\\" },
+        .{ "C:/", "C:\\" },
+    };
+    for (cases) |case| {
+        const result = (try conemuPathToLocal(alloc, case[0])).?;
+        defer alloc.free(result);
+        try testing.expectEqualStrings(case[1], result);
+    }
+}
+
+test "conemuPathToLocal maps the UNC form wslpath prints to the distro's own path" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "\\\\wsl.localhost\\Ubuntu\\home\\aman\\src", "/home/aman/src" },
+        .{ "\\\\wsl$\\Ubuntu\\home\\aman", "/home/aman" },
+        .{ "\"\\\\wsl.localhost\\Ubuntu-24.04\\mnt\\data\"", "/mnt/data" },
+        .{ "\\\\wsl.localhost\\Ubuntu", "/" },
+    };
+    for (cases) |case| {
+        const result = (try conemuPathToLocal(alloc, case[0])).?;
+        defer alloc.free(result);
+        try testing.expectEqualStrings(case[1], result);
+    }
+}
+
+test "conemuPathToLocal leaves everything but a drive-absolute path to the caller" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    for ([_][]const u8{
+        // The URL forms, including the one noctty's cmd integration sends.
+        "kitty-shell-cwd://localhost/C:\\Users\\aman",
+        "file://localhost/C:/Users/aman",
+        // Not drive-absolute, and not WSL's own UNC form.
+        "",
+        "\"\"",
+        "C:",
+        "C:Users",
+        "Users\\aman",
+        "\\Users\\aman",
+        "/mnt/c/Users",
+        "\\\\server\\share",
+        "\\\\server\\wsl.localhost\\share",
+        "\\\\?\\UNC\\server\\share",
+        "\\\\.\\pipe\\x",
+        "\\\\wsl",
+        // One pair of quotes only, and both of them.
+        "\"\"C:\\Users\"\"",
+        "\"C:\\Users",
+        "C:\\Users\"",
+    }) |value| {
+        try testing.expect(try conemuPathToLocal(alloc, value) == null);
+    }
 }
 
 test "osc7PathToLocal strips the uri slash from a unc path" {

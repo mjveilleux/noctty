@@ -161,6 +161,16 @@ that:
   command marks and exit codes. Noctty does not activate Clink. Without the
   loaded Clink script, prompt/cwd marks still work but command-finish marks and
   exit codes are unavailable.
+- Working-directory reports drive tab titles and the directory new tabs and
+  splits start in. OSC 7 must be a URL (`file://`, or the `kitty-shell-cwd://`
+  noctty's own cmd integration sends) whose host is `localhost` or this machine
+  (NetBIOS, DNS host or fully qualified name, in any letter case, with or
+  without a trailing dot), so Git Bash, WSL, fish and nushell reports count and
+  an ssh session's does not. OSC 9;9, the form Windows Terminal documents and
+  oh-my-posh's `osc99` and nushell send, also takes a plain drive-absolute path
+  (`C:\Users\me`, quoted or not) or the `\\wsl.localhost\Distro\...` path
+  `wslpath -w` prints, with no host to check. Network shares, device paths and
+  paths with control bytes are ignored in both.
 
 ### Terminfo
 

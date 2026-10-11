@@ -380,7 +380,7 @@ pub const StreamHandler = struct {
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.decaln(),
             .window_title => try self.windowTitle(value.title),
-            .report_pwd => try self.reportPwd(value.url),
+            .report_pwd => try self.reportPwd(value.url, value.conemu),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
             .progress_report => self.progressReport(value),
             .program_status => self.programStatus(value),
@@ -1204,7 +1204,7 @@ pub const StreamHandler = struct {
         try self.terminal.semanticPrompt(cmd);
     }
 
-    fn reportPwd(self: *StreamHandler, url: []const u8) !void {
+    fn reportPwd(self: *StreamHandler, url: []const u8, conemu: bool) !void {
         // Special handling for the empty URL. We treat the empty URL
         // as resetting the pwd as if we never saw a pwd. I can't find any
         // other terminal that does this but it seems like a reasonable
@@ -1225,6 +1225,13 @@ pub const StreamHandler = struct {
             // Report the change.
             self.surfaceMessageWriter(.{ .pwd_change = .{ .stable = "" } });
             return;
+        }
+
+        // ConEmu's OSC 9;9 usually carries a plain Windows path (the form
+        // Windows Terminal documents, oh-my-posh's `osc99` and nushell send),
+        // which is not a URI. OSC 7 stays strict and never takes this branch.
+        if (comptime builtin.os.tag == .windows) {
+            if (conemu and try self.reportConemuPwd(url)) return;
         }
 
         // Attempt to parse this file-style URI using options appropriate
@@ -1287,6 +1294,35 @@ pub const StreamHandler = struct {
             else => return err,
         };
 
+        try self.setReportedPwd(path);
+    }
+
+    /// The plain-path form of ConEmu's OSC 9;9. Returns false when `value` is
+    /// not a drive-absolute path, so that the caller reads it as a URL (noctty's
+    /// cmd integration sends `kitty-shell-cwd://localhost/%P`); true when it
+    /// handled the report, including by refusing it.
+    ///
+    /// 9;9 carries no host, so there is no locality check here, as in Windows
+    /// Terminal; the path gets the same screening as an OSC 7 path.
+    fn reportConemuPwd(self: *StreamHandler, value: []const u8) !bool {
+        var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
+        var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
+        defer arena_alloc.deinit();
+        const scratch = stack_alloc.get();
+
+        const local = (try configpkg.windows_shell.conemuPathToLocal(scratch, value)) orelse return false;
+        const path = screenWindowsPwd(local) catch |err| switch (err) {
+            error.InvalidOsc7Path => {
+                log.warn("OSC 9;9 path contains unsafe bytes", .{});
+                return true;
+            },
+        };
+        try self.setReportedPwd(path);
+        return true;
+    }
+
+    /// Record `path` as the working directory and tell the surface.
+    fn setReportedPwd(self: *StreamHandler, path: []const u8) !void {
         log.debug("terminal pwd: {s}", .{path});
         try self.terminal.setPwd(path);
 
@@ -1312,15 +1348,19 @@ pub const StreamHandler = struct {
         const raw_path = try uri.path.toRawMaybeAlloc(alloc);
         if (builtin.os.tag != .windows) return raw_path;
 
-        const path = try configpkg.windows_shell.osc7PathToLocal(alloc, raw_path);
-        if (!configpkg.windows_shell.isSafeWindowsPath(path)) return error.InvalidOsc7Path;
+        return try screenWindowsPwd(try configpkg.windows_shell.osc7PathToLocal(alloc, raw_path));
+    }
 
-        // A network share or device path is not a working directory this
-        // terminal acts on: spawning already replaces it with the home folder
-        // and links to such paths are never opened. Keeping it as the pwd would
-        // let later consumers (relative link resolution, session files) touch
-        // it, so refuse it here, like the link opener does. WSL paths were
-        // normalized to `/...` above and are unaffected.
+    /// Refuse a Windows path that is not safe to keep as the working directory.
+    ///
+    /// A network share or device path is not a working directory this
+    /// terminal acts on: spawning already replaces it with the home folder
+    /// and links to such paths are never opened. Keeping it as the pwd would
+    /// let later consumers (relative link resolution, session files) touch
+    /// it, so refuse it here, like the link opener does. WSL paths are
+    /// normalized to `/...` before this and are unaffected.
+    fn screenWindowsPwd(path: []const u8) error{InvalidOsc7Path}![]const u8 {
+        if (!configpkg.windows_shell.isSafeWindowsPath(path)) return error.InvalidOsc7Path;
         if (internal_os.path.isNetworkOrDevicePath(path)) return error.InvalidOsc7Path;
         return path;
     }
@@ -1555,15 +1595,29 @@ pub const StreamHandler = struct {
     ) !void {
         var message = apprt.surface.Message{ .desktop_notification = undefined };
 
-        const title_len = @min(title.len, message.desktop_notification.title.len);
-        @memcpy(message.desktop_notification.title[0..title_len], title[0..title_len]);
-        message.desktop_notification.title[title_len] = 0;
+        const title_cut = utf8Prefix(title, message.desktop_notification.title.len);
+        @memcpy(message.desktop_notification.title[0..title_cut.len], title_cut);
+        message.desktop_notification.title[title_cut.len] = 0;
 
-        const body_len = @min(body.len, message.desktop_notification.body.len);
-        @memcpy(message.desktop_notification.body[0..body_len], body[0..body_len]);
-        message.desktop_notification.body[body_len] = 0;
+        const body_cut = utf8Prefix(body, message.desktop_notification.body.len);
+        @memcpy(message.desktop_notification.body[0..body_cut.len], body_cut);
+        message.desktop_notification.body[body_cut.len] = 0;
 
         self.surfaceMessageWriter(message);
+    }
+
+    /// The longest prefix of `text` that fits in `max` bytes without ending
+    /// inside a UTF-8 sequence. A cut through one leaves invalid UTF-8, which
+    /// the WinRT toast conversion rejects, so the notification would fall back
+    /// to the banner.
+    fn utf8Prefix(text: []const u8, max: usize) []const u8 {
+        if (text.len <= max) return text;
+        // The first byte that does not fit is a continuation byte (10xxxxxx)
+        // when the cut is inside a sequence. Back up to its lead byte, which
+        // goes with the sequence.
+        var end = max;
+        while (end > 0 and text[end] & 0xC0 == 0x80) end -= 1;
+        return text[0..end];
     }
 
     /// Send a report to the pty.
@@ -2346,6 +2400,307 @@ test "OSC 7 pwd refuses network and device paths" {
         const path = try StreamHandler.decodeOsc7PathForPwd(arena.allocator(), uri);
         try std.testing.expectEqualStrings(case[1], path);
     }
+}
+
+/// A stream handler wired to a real terminal and an app mailbox, for tests
+/// that feed it escape sequences and read back what it reported.
+const TestStream = struct {
+    term: terminal.Terminal,
+    termio_mailbox: termio.Mailbox,
+    renderer_mutex: std.Thread.Mutex,
+    renderer_state: renderer.State,
+    rt_app: apprt.App,
+    app_queue: *AppMailbox.Queue,
+    stream: StreamHandler.Stream,
+
+    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
+
+    /// `self` holds pointers into itself, so it must not move after this.
+    fn init(self: *TestStream, alloc: Allocator) !void {
+        self.term = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
+        errdefer self.term.deinit(alloc);
+        self.termio_mailbox = try termio.Mailbox.initSPSC(alloc);
+        errdefer self.termio_mailbox.deinit(alloc);
+        self.renderer_mutex = .{};
+        self.renderer_state = undefined;
+        self.renderer_state.mutex = &self.renderer_mutex;
+        self.renderer_state.terminal = &self.term;
+        self.rt_app = undefined;
+        self.rt_app.windows = .empty;
+        self.rt_app.ui_thread_id = 0;
+        self.app_queue = try AppMailbox.Queue.create(alloc);
+        errdefer self.app_queue.destroy(alloc);
+
+        self.stream = StreamHandler.Stream.initAlloc(alloc, .{
+            .alloc = alloc,
+            .size = undefined,
+            .terminal = &self.term,
+            .termio_mailbox = &self.termio_mailbox,
+            .surface_mailbox = .{
+                .surface = undefined,
+                .app = .{ .rt_app = &self.rt_app, .mailbox = self.app_queue },
+            },
+            .renderer_state = &self.renderer_state,
+            .renderer_mailbox = undefined,
+            .renderer_wakeup = undefined,
+            .default_cursor_style = .block,
+            .default_cursor_blink = true,
+            .enquiry_response = "",
+            .osc_color_report_format = .none,
+            .clipboard_write = .allow,
+        });
+        self.stream.handler.seen_title = true;
+    }
+
+    fn deinit(self: *TestStream, alloc: Allocator) void {
+        self.stream.deinit();
+        while (self.app_queue.pop()) |value| {
+            var message = value;
+            message.deinit(alloc);
+        }
+        self.app_queue.destroy(alloc);
+        self.termio_mailbox.deinit(alloc);
+        self.term.deinit(alloc);
+    }
+
+    /// The next surface message, or null when none is left.
+    fn nextSurfaceMessage(self: *TestStream) ?apprt.surface.Message {
+        return popProgramStatusTestSurfaceMessage(self.app_queue);
+    }
+
+    /// Like `nextSurfaceMessage`, but a missing message fails the test
+    /// instead of panicking.
+    fn expectSurfaceMessage(self: *TestStream) !apprt.surface.Message {
+        return self.nextSurfaceMessage() orelse error.NoSurfaceMessage;
+    }
+
+    /// Fails the test, rather than panicking, when the pwd is unset.
+    fn expectPwd(self: *TestStream, expected: []const u8) !void {
+        const pwd = self.term.getPwd() orelse return error.PwdNotSet;
+        try std.testing.expectEqualStrings(expected, pwd);
+    }
+};
+
+test "OSC 9;9 sets the pwd from a plain Windows path" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var h: TestStream = undefined;
+    try h.init(alloc);
+    defer h.deinit(alloc);
+
+    // The forms Windows Terminal's docs, oh-my-posh's `osc99` and nushell send:
+    // a plain path, quoted or not, with either separator.
+    const accepted = [_]struct { []const u8, []const u8 }{
+        .{ "C:\\Users\\test\\project", "C:\\Users\\test\\project" },
+        .{ "\"C:\\Users\\test\\my project\"", "C:\\Users\\test\\my project" },
+        .{ "D:/work/noctty", "D:\\work\\noctty" },
+        .{ "C:\\", "C:\\" },
+    };
+    for (accepted) |case| {
+        var seq: std.ArrayList(u8) = .empty;
+        defer seq.deinit(alloc);
+        try seq.writer(alloc).print("\x1b]9;9;{s}\x1b\\", .{case[0]});
+        h.stream.nextSlice(seq.items);
+
+        try h.expectPwd(case[1]);
+        var message = try h.expectSurfaceMessage();
+        defer message.deinit();
+        try std.testing.expect(message == .pwd_change);
+        try std.testing.expect(h.nextSurfaceMessage() == null);
+    }
+
+    // The UNC form `wslpath -w` prints, the recipe Windows Terminal documents
+    // for WSL, is the distro's own path, as in an OSC 7 URL.
+    h.stream.nextSlice("\x1b]9;9;\\\\wsl.localhost\\Ubuntu\\home\\me\x1b\\");
+    try h.expectPwd("/home/me");
+    var wsl_message = try h.expectSurfaceMessage();
+    wsl_message.deinit();
+
+    // The URL form the cmd integration sends still works beside them.
+    h.stream.nextSlice("\x1b]9;9;kitty-shell-cwd://localhost/C:\\Users\\cmd\x1b\\");
+    try h.expectPwd("C:\\Users\\cmd");
+    var url_message = try h.expectSurfaceMessage();
+    url_message.deinit();
+}
+
+test "OSC 9;9 pwd keeps the network and device screening" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var h: TestStream = undefined;
+    try h.init(alloc);
+    defer h.deinit(alloc);
+
+    h.stream.nextSlice("\x1b]9;9;C:\\Users\\test\x1b\\");
+    try h.expectPwd("C:\\Users\\test");
+    var first = try h.expectSurfaceMessage();
+    first.deinit();
+
+    // None of these is a drive-absolute path, or each is a network or device
+    // path after conversion: the previous pwd stays and the surface hears
+    // nothing, the same as for OSC 7.
+    const refused = [_][]const u8{
+        "\\\\server\\share",
+        "\\\\server\\share\\dir",
+        "\"\\\\server\\share\"",
+        "\\\\?\\C:\\Users\\me",
+        "\\\\?\\UNC\\server\\share",
+        "\\\\.\\pipe\\x",
+        "\\\\.\\GLOBALROOT\\Device\\Mup\\server\\share",
+        "//server/share",
+        // Drive-absolute, but with a control byte. The parser drops most C0
+        // bytes from an OSC; DEL goes through.
+        "C:\\a\x7fb",
+        // Not drive-absolute.
+        "C:Users\\me",
+        "Users\\me",
+        "\\Users\\me",
+        "/mnt/c/Users/me",
+        "\"C:\\Users\\me",
+        "C:\\Users\\me\"",
+        "\"\"C:\\Users\\me\"\"",
+    };
+    for (refused) |value| {
+        var seq: std.ArrayList(u8) = .empty;
+        defer seq.deinit(alloc);
+        try seq.writer(alloc).print("\x1b]9;9;{s}\x1b\\", .{value});
+        h.stream.nextSlice(seq.items);
+        h.expectPwd("C:\\Users\\test") catch |err| {
+            std.debug.print("accepted: {s}\n", .{value});
+            return err;
+        };
+        try std.testing.expect(h.nextSurfaceMessage() == null);
+    }
+
+    // The screening itself, for what cannot reach it through an OSC: the
+    // parser drops or ends the sequence on most control bytes.
+    try std.testing.expectError(error.InvalidOsc7Path, StreamHandler.screenWindowsPwd("C:\\a\x01b"));
+    try std.testing.expectError(error.InvalidOsc7Path, StreamHandler.screenWindowsPwd("\\\\server\\share"));
+    try std.testing.expectEqualStrings("C:\\a", try StreamHandler.screenWindowsPwd("C:\\a"));
+}
+
+test "OSC 7 stays strict: a plain path or a host that is not this machine" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var h: TestStream = undefined;
+    try h.init(alloc);
+    defer h.deinit(alloc);
+
+    h.stream.nextSlice("\x1b]7;file://localhost/C:/Users/test\x1b\\");
+    try h.expectPwd("C:\\Users\\test");
+    var first = try h.expectSurfaceMessage();
+    first.deinit();
+
+    // OSC 7 is a file URL. The plain path 9;9 takes is not one, and OSC 7 has
+    // no business reporting a path with no host to check.
+    h.stream.nextSlice("\x1b]7;C:\\Windows\x1b\\");
+    h.stream.nextSlice("\x1b]7;\"C:\\Windows\"\x1b\\");
+    h.stream.nextSlice("\x1b]7;C:/Windows\x1b\\");
+    // A report from another machine, such as an ssh session's shell.
+    h.stream.nextSlice("\x1b]7;file://not-this-machine/C:/Windows\x1b\\");
+    h.stream.nextSlice("\x1b]7;file://not-this-machine.example.com/C:/Windows\x1b\\");
+    try h.expectPwd("C:\\Users\\test");
+    try std.testing.expect(h.nextSurfaceMessage() == null);
+}
+
+test "OSC 7 accepts this machine's name in any letter case" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var h: TestStream = undefined;
+    try h.init(alloc);
+    defer h.deinit(alloc);
+
+    // Git Bash, WSL, fish and nushell send the real-case DNS name where the
+    // NetBIOS name is upper-case. Derive every form from this machine, so the
+    // test names none.
+    var name_buf: [internal_os.hostname.computer_name_max]u8 = undefined;
+    const ours = internal_os.hostname.computerName(.netbios, &name_buf) orelse
+        return error.SkipZigTest;
+    const lower = try std.ascii.allocLowerString(alloc, ours);
+    defer alloc.free(lower);
+    const upper = try std.ascii.allocUpperString(alloc, ours);
+    defer alloc.free(upper);
+    const absolute = try std.fmt.allocPrint(alloc, "{s}.", .{lower});
+    defer alloc.free(absolute);
+
+    for ([_][]const u8{ ours, lower, upper, absolute, "LocalHost" }) |host| {
+        var seq: std.ArrayList(u8) = .empty;
+        defer seq.deinit(alloc);
+        try seq.writer(alloc).print("\x1b]7;file://{s}/C:/Users/test\x1b\\", .{host});
+        h.stream.nextSlice(seq.items);
+        h.expectPwd("C:\\Users\\test") catch |err| {
+            std.debug.print("rejected host: {s}\n", .{host});
+            return err;
+        };
+        var message = try h.expectSurfaceMessage();
+        message.deinit();
+
+        // Reset, so the next host has to set it again.
+        h.stream.nextSlice("\x1b]7;\x1b\\");
+        try std.testing.expect(h.term.getPwd() == null);
+        var reset = try h.expectSurfaceMessage();
+        reset.deinit();
+    }
+}
+
+test "utf8Prefix never cuts a UTF-8 sequence" {
+    const text = "a" ++ "é" ++ "€" ++ "😀" ++ "é" ++ "b";
+    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+
+    // Every cut gives the longest prefix that fits and is still valid UTF-8.
+    var max: usize = 0;
+    while (max <= text.len + 2) : (max += 1) {
+        const prefix = StreamHandler.utf8Prefix(text, max);
+        try std.testing.expect(prefix.len <= max);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
+        try std.testing.expectEqualStrings(text[0..prefix.len], prefix);
+        if (prefix.len < text.len) {
+            // The next code point would not have fit.
+            const next_len = try std.unicode.utf8ByteSequenceLength(text[prefix.len]);
+            try std.testing.expect(prefix.len + next_len > max);
+        }
+    }
+
+    // The case from the report: 40 two-byte letters against a 63-byte title.
+    const title = "é" ** 40;
+    try std.testing.expectEqual(@as(usize, 62), StreamHandler.utf8Prefix(title, 63).len);
+    // Text that fits, ASCII or not, is returned whole.
+    try std.testing.expectEqualStrings(title, StreamHandler.utf8Prefix(title, 80));
+    try std.testing.expectEqualStrings("hello", StreamHandler.utf8Prefix("hello", 63));
+    try std.testing.expectEqualStrings("", StreamHandler.utf8Prefix("", 0));
+    // A code point wider than the limit leaves nothing.
+    try std.testing.expectEqualStrings("", StreamHandler.utf8Prefix("😀", 3));
+}
+
+test "desktop notifications are cut on a code point boundary" {
+    const alloc = std.testing.allocator;
+
+    var h: TestStream = undefined;
+    try h.init(alloc);
+    defer h.deinit(alloc);
+
+    // A 63-byte title and 255-byte body cannot end inside a two-byte letter.
+    var seq: std.ArrayList(u8) = .empty;
+    defer seq.deinit(alloc);
+    try seq.appendSlice(alloc, "\x1b]777;notify;");
+    try seq.appendSlice(alloc, "é" ** 40);
+    try seq.append(alloc, ';');
+    try seq.appendSlice(alloc, "é" ** 200);
+    try seq.appendSlice(alloc, "\x1b\\");
+    h.stream.nextSlice(seq.items);
+
+    var message = try h.expectSurfaceMessage();
+    defer message.deinit();
+    try std.testing.expect(message == .desktop_notification);
+    const title = std.mem.sliceTo(&message.desktop_notification.title, 0);
+    const body = std.mem.sliceTo(&message.desktop_notification.body, 0);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(title));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body));
+    try std.testing.expectEqual(@as(usize, 62), title.len);
+    try std.testing.expectEqual(@as(usize, 254), body.len);
 }
 
 fn popProgramStatusTestWrite(mailbox: *termio.Mailbox) ?[]const u8 {

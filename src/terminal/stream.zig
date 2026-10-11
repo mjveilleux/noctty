@@ -328,6 +328,10 @@ pub const Action = union(Key) {
     pub const ReportPwd = struct {
         url: []const u8,
 
+        /// The report is ConEmu's OSC 9;9: `url` is usually a plain path, not
+        /// a file URL, and has no host.
+        conemu: bool = false,
+
         pub const C = lib.String;
 
         pub fn cval(self: ReportPwd) ReportPwd.C {
@@ -2018,7 +2022,7 @@ pub fn Stream(comptime H: type) type {
 
                 .report_pwd => |v| {
                     @branchHint(.likely);
-                    self.handler.vt(.report_pwd, .{ .url = v.value });
+                    self.handler.vt(.report_pwd, .{ .url = v.value, .conemu = v.conemu });
                 },
 
                 .mouse_shape => |v| {

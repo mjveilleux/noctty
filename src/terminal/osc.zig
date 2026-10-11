@@ -65,6 +65,11 @@ pub const Command = union(Key) {
         /// The reported pwd value. This is not checked for validity. It should
         /// be a file URL but it is up to the caller to utilize this value.
         value: [:0]const u8,
+
+        /// The report came from ConEmu's OSC 9;9, whose value is usually a
+        /// plain path (`C:\Users\me`, possibly in double quotes) and carries
+        /// no host, unlike OSC 7's file URL.
+        conemu: bool = false,
     },
 
     /// OSC 22. Set the mouse shape. There doesn't seem to be a standard

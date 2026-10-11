@@ -528,11 +528,23 @@ pub const exp = struct {
             lpStartupInfo: *windows.STARTUPINFOW,
             lpProcessInformation: *windows.PROCESS_INFORMATION,
         ) callconv(.winapi) windows.BOOL;
-        /// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getcomputernamea
-        pub extern "kernel32" fn GetComputerNameA(
-            lpBuffer: windows.LPSTR,
+        /// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getcomputernameexw
+        pub extern "kernel32" fn GetComputerNameExW(
+            NameType: COMPUTER_NAME_FORMAT,
+            lpBuffer: ?windows.LPWSTR,
             nSize: *windows.DWORD,
         ) callconv(.winapi) windows.BOOL;
+    };
+
+    /// The `NameType` values of `GetComputerNameExW` that name this machine.
+    pub const COMPUTER_NAME_FORMAT = enum(c_int) {
+        /// The NetBIOS name: upper-case and cut at 15 characters.
+        netbios = 0,
+        /// The DNS host name, without the domain: what `hostname` prints in
+        /// Git Bash and, for a machine named the same, in WSL.
+        dns_hostname = 1,
+        /// The fully qualified DNS name.
+        dns_fully_qualified = 3,
     };
 
     pub const PROC_THREAD_ATTRIBUTE_NUMBER = 0x0000FFFF;

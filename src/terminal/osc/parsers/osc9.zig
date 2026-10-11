@@ -258,6 +258,7 @@ pub fn parse(parser: anytype, _: ?u8) ?*@TypeOf(parser.command) {
                 parser.command = .{
                     .report_pwd = .{
                         .value = data[2 .. data.len - 1 :0],
+                        .conemu = true,
                     },
                 };
                 return &parser.command;
