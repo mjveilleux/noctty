@@ -10535,11 +10535,12 @@ pub const App = struct {
         };
     }
 
-    /// Serialise `pending` into a temp file adjacent to the target,
-    /// then atomic-rename via `ReplaceFileW` (falls back to
-    /// `MoveFileExW` when the target is new). Finally re-load the
-    /// config from disk and push it through `CoreApp.updateConfig`
-    /// so every surface picks up the change on its next repaint.
+    /// Patch the edited settings into the target file (`persistSettings`:
+    /// a temp file beside the real file, then an atomic replace via
+    /// `ReplaceFileW`, with `MoveFileExW` when the target is new). Finally
+    /// re-load the config from disk and push it through
+    /// `CoreApp.updateConfig` so every surface picks up the change on its
+    /// next repaint.
     ///
     /// Returns on error; caller (settings window) is responsible for
     /// surfacing the failure. `pending` is borrowed, not consumed —
