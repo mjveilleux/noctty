@@ -992,6 +992,7 @@ pub fn init(
             .adopted_session = if (builtin.os.tag == .windows)
                 rt_surface.takeAdoptedSession()
             else {},
+            .windows_spare_shell = config.@"windows-spare-shell",
         };
         env_owned = false;
         var io_exec = try termio.Exec.init(alloc, exec_config);

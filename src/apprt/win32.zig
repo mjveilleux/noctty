@@ -19731,6 +19731,17 @@ const Host = struct {
                 else
                     adjustColor(theme.chrome_border, -14, -14, -14);
             }
+            if (theme.tab_active_bg) |active_bg| {
+                if (active) {
+                    colors.bg = active_bg;
+                } else if (hovered) {
+                    colors.bg = blendColorRGB(theme.chrome_bg, active_bg, 0.5);
+                    colors.border = colors.bg;
+                } else {
+                    colors.bg = theme.chrome_bg;
+                    colors.border = theme.chrome_bg;
+                }
+            }
         }
         const bg = colors.bg;
         const border = colors.border;
@@ -22033,7 +22044,9 @@ const Host = struct {
                     .right = client_rect.right - self.scaled(6),
                     .bottom = tab_h - self.scaled(4),
                 };
-                if (cluster_rect.right > cluster_rect.left and cluster_rect.bottom > cluster_rect.top) {
+                // Flat tabs (a theme that fills the active tab) get flat buttons too.
+                const boxed = titlebar_theme.tab_active_bg == null;
+                if (boxed and cluster_rect.right > cluster_rect.left and cluster_rect.bottom > cluster_rect.top) {
                     drawRoundedRect(
                         hdc,
                         cluster_rect,
@@ -24217,10 +24230,61 @@ fn resolveTheme(config: *const configpkg.Config) ThemeColors {
         .light => lightTheme(),
         .system => if (isSystemDarkMode()) darkTheme() else lightTheme(),
         .auto => if (isSystemDarkMode()) darkTheme() else lightTheme(),
-        .ghostty => darkTheme(),
+        .ghostty => ghosttyTheme(config),
     };
     const follow = config.@"accent-follow-system";
     return withSystemTabAccent(theme, follow, if (follow) resolveSystemAccentColor() else null);
+}
+
+/// `window-theme = ghostty`: the chrome takes the terminal's own colors
+/// instead of a fixed gray, so the tab strip, overlays and dividers belong to
+/// the theme. The strip is `window-titlebar-background` (or a shade of the
+/// terminal background), the active tab is filled with the terminal
+/// background, touched with the accent, so it reads as joined to the terminal
+/// below; the accent is
+/// the cursor color (or palette blue).
+fn ghosttyTheme(config: *const configpkg.Config) ThemeColors {
+    const background = rgb(config.background.r, config.background.g, config.background.b);
+    const foreground = rgb(config.foreground.r, config.foreground.g, config.foreground.b);
+    const is_dark = titlebarBandIsDark(.{
+        .r = config.background.r,
+        .g = config.background.g,
+        .b = config.background.b,
+    });
+    var theme = if (is_dark) darkTheme() else lightTheme();
+
+    const blue = config.palette.value[4];
+    var accent = rgb(blue.r, blue.g, blue.b);
+    if (config.@"cursor-color") |cursor| switch (cursor) {
+        .color => |color| accent = rgb(color.r, color.g, color.b),
+        else => {},
+    };
+    const strip = if (config.@"window-titlebar-background") |color|
+        rgb(color.r, color.g, color.b)
+    else
+        blendColorRGB(background, if (is_dark) rgb(0, 0, 0) else rgb(0xFF, 0xFF, 0xFF), 0.3);
+    const border = blendColorRGB(strip, foreground, 0.12);
+
+    theme.chrome_bg = strip;
+    theme.chrome_border = border;
+    theme.overlay_bg = background;
+    theme.overlay_border = border;
+    theme.status_bg = strip;
+    theme.text_primary = foreground;
+    theme.text_secondary = blendColorRGB(foreground, strip, 0.4);
+    theme.text_disabled = blendColorRGB(foreground, strip, 0.6);
+    theme.edit_fg = foreground;
+    theme.button_chrome_fg = blendColorRGB(foreground, strip, 0.4);
+    theme.accent = accent;
+    theme.accent_hover = blendColorRGB(accent, foreground, 0.2);
+    theme.button_active_border = accent;
+    theme.pane_divider = border;
+    theme.pane_divider_focused = accent;
+    // The terminal background with a touch of the accent: one with the terminal below, but
+    // still plainly the selected tab.
+    theme.tab_active_bg = blendColorRGB(background, accent, 0.14);
+    theme.is_dark = is_dark;
+    return theme;
 }
 
 /// DESIGN.md's floor for essential non-text indicators against the surface

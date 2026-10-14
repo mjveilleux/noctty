@@ -3192,6 +3192,14 @@ keybind: Keybinds = .{},
 /// hard-fail attachment to make descendant cleanup deterministic.
 @"windows-job-object-kill-on-close": bool = false,
 
+/// Windows-only (noctty fork): keep one shell started in the background and
+/// hand it to the next new window, tab or split that would start the same
+/// command in the same directory, so its prompt is there at once instead of
+/// after the shell's startup (most of a second for pwsh with a profile).
+/// Taking it starts the next one. Costs one idle shell's memory. Launches
+/// that run a one-off command (`-e`) should turn it off.
+@"windows-spare-shell": bool = false,
+
 /// Controls Windows console UTF-8 setup for bare interactive Command Prompt
 /// launches and interactive PowerShell sessions. This has no effect on WSL or
 /// Git Bash sessions.

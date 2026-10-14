@@ -1169,8 +1169,11 @@ pub fn tabButtonTitleBudget(
     return @max(tab_button_min_title_width, max_width -| decoration_width);
 }
 
+/// The active tab is shown by its fill and accent underline, so its label
+/// carries no `"* "` marker (upstream had one; this fork dropped it).
 fn tabButtonActiveMarker(active: bool) []const u8 {
-    return if (active) "* " else "";
+    _ = active;
+    return "";
 }
 
 pub fn buildTabButtonLabel(
@@ -3082,12 +3085,12 @@ test "win32 elevated host title prefixes surface and default title once" {
     try std.testing.expectEqualStrings("Administrator: [2/3] pwsh", idempotent);
 }
 
-test "win32 buildTabButtonLabel marks active tab and pane count" {
+test "win32 buildTabButtonLabel shows the index and pane count, no active marker" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const title = try buildTabButtonLabel(std.testing.allocator, "pwsh", 1, true, 3, 24, true);
     defer std.testing.allocator.free(title);
-    try std.testing.expectEqualStrings("* 2: pwsh (3)", title);
+    try std.testing.expectEqualStrings("2: pwsh (3)", title);
 }
 
 test "win32 buildTabButtonLabel omits pane count for single pane tabs" {
@@ -3198,9 +3201,9 @@ test "win32 hostLabelIsCompacted tracks what the drawn label hides" {
 test "win32 tabButtonTitleBudget charges the label's decorations" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    // "* " + "1: " + " (3)" is nine cells the title cannot also spend.
-    try std.testing.expectEqual(@as(usize, 15), tabButtonTitleBudget(0, true, 3, 24, true));
-    try std.testing.expectEqual(@as(usize, 19), tabButtonTitleBudget(0, true, 3, 24, false));
+    // "1: " + " (3)" is seven cells the title cannot also spend.
+    try std.testing.expectEqual(@as(usize, 17), tabButtonTitleBudget(0, true, 3, 24, true));
+    try std.testing.expectEqual(@as(usize, 21), tabButtonTitleBudget(0, true, 3, 24, false));
     try std.testing.expectEqual(@as(usize, 21), tabButtonTitleBudget(1, false, 1, 24, false));
     // A button too narrow for its own decorations still shows an ellipsis.
     try std.testing.expectEqual(@as(usize, 3), tabButtonTitleBudget(0, true, 3, 6, true));
@@ -3226,7 +3229,7 @@ test "win32 tab tooltip decision matches for an active tab and its neighbour" {
     defer std.testing.allocator.free(active_label);
     const inactive_label = try buildTabButtonLabel(std.testing.allocator, fits, 1, false, 1, max_width, false);
     defer std.testing.allocator.free(inactive_label);
-    try std.testing.expectEqualStrings("* 1: session-alpha-1234", active_label);
+    try std.testing.expectEqualStrings("1: session-alpha-1234", active_label);
     try std.testing.expectEqualStrings("2: session-alpha-1234", inactive_label);
     try std.testing.expect(displayWidth(active_label) <= max_width);
     try std.testing.expect(displayWidth(inactive_label) <= max_width);

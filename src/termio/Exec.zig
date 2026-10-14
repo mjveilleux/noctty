@@ -785,7 +785,186 @@ pub const Config = struct {
     rt_post_fork_info: Command.RtPostForkInfo,
     windows_job_object_plan: WindowsJobObjectPlan = if (builtin.os.tag == .windows) .{ .mode = .never } else {},
     adopted_session: if (builtin.os.tag == .windows) ?ptypkg.AdoptedSession else void = if (builtin.os.tag == .windows) null else {},
+    /// `windows-spare-shell`: see `SpareShell`.
+    windows_spare_shell: bool = false,
 };
+
+/// noctty fork: one shell kept started in a hidden pseudo console, handed to
+/// the next window or tab that would start the very same shell
+/// (`windows-spare-shell`). pwsh with a profile takes most of a second to
+/// reach its prompt; a spare has paid that before the window opens. Taking
+/// one starts its replacement in the background.
+///
+/// A spare only goes to a surface that would launch the same command line in
+/// the same directory with the same environment, so it is the shell that
+/// surface would have started anyway. The one difference is
+/// `GHOSTTY_SURFACE_ID`, which the spare cannot know in advance and so does
+/// not carry. WSL launches never use spares: their TERM is negotiated per
+/// launch.
+const SpareShell = if (builtin.os.tag == .windows) struct {
+    const Slot = struct {
+        key: u64,
+        sub: Subprocess,
+    };
+
+    var mutex: std.Thread.Mutex = .{};
+    var slot: ?Slot = null;
+    var refilling: bool = false;
+
+    /// Wait before starting a replacement, so it does not compete for the
+    /// CPU with the shell that was just shown.
+    const refill_delay_ms_after_take = 500;
+    const refill_delay_ms_after_cold_start = 1500;
+
+    const ignored_env = "GHOSTTY_SURFACE_ID";
+
+    fn eligible(sub: *const Subprocess) bool {
+        return sub.spare_shell and sub.args.len > 0 and
+            sub.wsl_probe == null and !windows_shell.isWslArgv(sub.args);
+    }
+
+    fn key(sub: *const Subprocess) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        for (sub.args) |arg| {
+            hasher.update(arg);
+            hasher.update("\x00");
+        }
+        hasher.update(if (sub.windows_cmd_shell) "cmd" else "direct");
+        hasher.update(sub.cwd orelse "");
+        std.hash.autoHash(&hasher, sub.windows_job_object_plan);
+        // Order-independent: the map's iteration order is not part of the
+        // environment.
+        var env_sum: u64 = 0;
+        if (sub.env) |*env| {
+            var it = env.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, ignored_env)) continue;
+                var entry_hasher = std.hash.Wyhash.init(1);
+                entry_hasher.update(entry.key_ptr.*);
+                entry_hasher.update("=");
+                entry_hasher.update(entry.value_ptr.*);
+                env_sum +%= entry_hasher.final();
+            }
+        }
+        std.hash.autoHash(&hasher, env_sum);
+        return hasher.final();
+    }
+
+    /// A not-yet-started copy of `sub` that owns its memory, for starting a
+    /// spare on another thread after `sub` has started (which frees its env).
+    fn snapshot(sub: *const Subprocess) !Subprocess {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        const args = try alloc.alloc([:0]const u8, sub.args.len);
+        for (sub.args, 0..) |arg, i| args[i] = try alloc.dupeZ(u8, arg);
+        var env: ?EnvMap = null;
+        if (sub.env) |*source| {
+            var copy = EnvMap.init(std.heap.page_allocator);
+            errdefer copy.deinit();
+            var it = source.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, ignored_env)) continue;
+                try copy.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+            env = copy;
+        }
+        return .{
+            .arena = arena,
+            .env = env,
+            .cwd = if (sub.cwd) |cwd| try alloc.dupeZ(u8, cwd) else null,
+            .args = args,
+            .windows_cmd_shell = sub.windows_cmd_shell,
+            .grid_size = sub.grid_size,
+            .screen_size = sub.screen_size,
+            .rt_pre_exec_info = sub.rt_pre_exec_info,
+            .rt_post_fork_info = sub.rt_post_fork_info,
+            .windows_job_object_plan = sub.windows_job_object_plan,
+            // A spare never starts spares of its own.
+            .spare_shell = false,
+        };
+    }
+
+    /// The spare for `k`, if there is one and its shell is still running.
+    fn take(k: u64) ?Subprocess {
+        const sub = sub: {
+            mutex.lock();
+            defer mutex.unlock();
+            const current = slot orelse return null;
+            if (current.key != k) return null;
+            slot = null;
+            break :sub current.sub;
+        };
+        var spare = sub;
+        const handle = (spare.process orelse {
+            spare.deinit();
+            return null;
+        }).fork_exec.pid orelse {
+            spare.deinit();
+            return null;
+        };
+        var exit_code: windows.DWORD = 0;
+        const still_active: windows.DWORD = 259;
+        if (windows.kernel32.GetExitCodeProcess(handle, &exit_code) == 0 or exit_code != still_active) {
+            log.info("spare shell had exited, starting a new shell instead", .{});
+            spare.deinit();
+            return null;
+        }
+        return spare;
+    }
+
+    /// Start a spare like `sub` on its own thread, `delay_ms` from now, and
+    /// keep it in the slot. A spare already there stays: a launch somewhere else
+    /// (a new window in a project folder) must not swap out the usual one.
+    fn refill(sub: *const Subprocess, k: u64, delay_ms: u64) void {
+        {
+            mutex.lock();
+            defer mutex.unlock();
+            if (refilling or slot != null) return;
+            refilling = true;
+        }
+        const copy = snapshot(sub) catch |err| {
+            log.warn("spare shell snapshot failed err={}", .{err});
+            finishRefill(null);
+            return;
+        };
+        const thread = std.Thread.spawn(.{}, run, .{ copy, k, delay_ms }) catch |err| {
+            log.warn("spare shell thread failed err={}", .{err});
+            var unused = copy;
+            unused.deinit();
+            finishRefill(null);
+            return;
+        };
+        thread.detach();
+    }
+
+    fn run(copy: Subprocess, k: u64, delay_ms: u64) void {
+        std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+        var sub = copy;
+        _ = sub.start(std.heap.page_allocator) catch |err| {
+            log.warn("spare shell start failed err={}", .{err});
+            sub.deinit();
+            finishRefill(null);
+            return;
+        };
+        log.info("spare shell ready path={s}", .{sub.args[0]});
+        finishRefill(.{ .key = k, .sub = sub });
+    }
+
+    fn finishRefill(ready: ?Slot) void {
+        var replaced: ?Subprocess = null;
+        {
+            mutex.lock();
+            defer mutex.unlock();
+            refilling = false;
+            if (ready) |new| {
+                if (slot) |old| replaced = old.sub;
+                slot = new;
+            }
+        }
+        if (replaced) |*old| old.deinit();
+    }
+} else struct {};
 
 const Subprocess = struct {
     const c = @cImport({
@@ -813,6 +992,10 @@ const Subprocess = struct {
     /// A WSL launch whose `TERM` `start` still has to list in `WSLENV`, once
     /// the distribution has said it knows the entry. See `wsl_env`.
     wsl_probe: ?wsl_env.Probe = null,
+
+    /// Whether `start` may take a spare shell and start the next one. See
+    /// `SpareShell`.
+    spare_shell: bool = false,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -1186,6 +1369,7 @@ const Subprocess = struct {
             .rt_post_fork_info = cfg.rt_post_fork_info,
             .windows_job_object_plan = cfg.windows_job_object_plan,
             .wsl_probe = wsl_probe,
+            .spare_shell = cfg.windows_spare_shell,
 
             // Should be initialized with initTerminal call.
             .grid_size = .{},
@@ -1208,10 +1392,13 @@ const Subprocess = struct {
 
     /// Start the subprocess. If the subprocess is already started this
     /// will crash.
-    pub fn start(self: *Subprocess, alloc: Allocator) !struct {
+    /// The pseudo console's ends, as start hands them to the read thread.
+    const Fds = struct {
         read: Pty.Fd,
         write: Pty.Fd,
-    } {
+    };
+
+    pub fn start(self: *Subprocess, alloc: Allocator) !Fds {
         if (comptime builtin.os.tag == .windows) if (self.adopted_client_process != null) {
             const pty = &(self.pty orelse return error.ProcessNotStarted);
             std.debug.assert(pty.isAdopted());
@@ -1225,6 +1412,17 @@ const Subprocess = struct {
         if (comptime builtin.os.tag == .windows) if (self.wsl_probe) |probe| {
             self.wsl_probe = null;
             if (self.env) |*env| try wsl_env.forwardProbedTerm(alloc, env, probe);
+        };
+
+        // A shell that is already running, if one was kept for this launch;
+        // either way, keep one ready for the next.
+        if (comptime builtin.os.tag == .windows) if (SpareShell.eligible(self)) {
+            const spare_key = SpareShell.key(self);
+            if (SpareShell.take(spare_key)) |spare| {
+                SpareShell.refill(self, spare_key, SpareShell.refill_delay_ms_after_take);
+                return self.adoptSpare(spare);
+            }
+            SpareShell.refill(self, spare_key, SpareShell.refill_delay_ms_after_cold_start);
         };
 
         // This function is funny because on POSIX systems it can
@@ -1418,6 +1616,39 @@ const Subprocess = struct {
                 .write = pty.master,
             },
         };
+    }
+
+    /// Take over a started spare's pseudo console and process (see
+    /// `SpareShell`) as if `start` had launched them, at this surface's size.
+    fn adoptSpare(self: *Subprocess, spare: Subprocess) !Fds {
+        var source = spare;
+        var cmd = source.process.?.fork_exec;
+        // The spare's memory goes with it; point the command at ours, which
+        // holds the same values.
+        cmd.path = self.args[0];
+        cmd.args = self.args;
+        cmd.cwd = self.cwd;
+        cmd.env = null;
+        cmd.data = self;
+        self.pty = source.pty;
+        self.process = .{ .fork_exec = cmd };
+        source.pty = null;
+        source.process = null;
+        source.deinit();
+
+        const pty = &self.pty.?;
+        pty.setSize(.{
+            .ws_row = std.math.cast(u16, self.grid_size.rows) orelse std.math.maxInt(u16),
+            .ws_col = std.math.cast(u16, self.grid_size.columns) orelse std.math.maxInt(u16),
+            .ws_xpixel = std.math.cast(u16, self.screen_size.width) orelse std.math.maxInt(u16),
+            .ws_ypixel = std.math.cast(u16, self.screen_size.height) orelse std.math.maxInt(u16),
+        }) catch |err| log.warn("spare shell resize failed err={}", .{err});
+        if (self.env) |*env| {
+            env.deinit();
+            self.env = null;
+        }
+        log.info("took spare shell path={s} pid={?}", .{ self.args[0], cmd.pid });
+        return .{ .read = pty.out_pipe, .write = pty.in_pipe };
     }
 
     /// This should be called after fork but before exec in the child process.

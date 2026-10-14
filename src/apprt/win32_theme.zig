@@ -66,6 +66,10 @@ pub const ThemeColors = struct {
     /// over another background (a custom titlebar band) derives its own
     /// readable accent from this, not from the already adjusted `tab_accent`.
     system_accent: ?u32 = null,
+    /// Fill for the active tab when the theme supplies one (`window-theme =
+    /// ghostty` uses the terminal background). Tabs are then flat: inactive
+    /// ones blend into the strip and only the active one is a shape.
+    tab_active_bg: ?u32 = null,
 
     // Buttons - idle
     button_bg: u32,
