@@ -3200,6 +3200,12 @@ keybind: Keybinds = .{},
 /// that run a one-off command (`-e`) should turn it off.
 @"windows-spare-shell": bool = false,
 
+/// Windows-only (noctty fork): show a new window fully transparent and fade
+/// it in once a window manager (a tiling one such as GlazeWM) has moved it to
+/// where it goes, or after 200 ms if nothing moves it. Its first visible frame
+/// is then never the size and place it was created at.
+@"windows-reveal-after-placement": bool = false,
+
 /// Controls Windows console UTF-8 setup for bare interactive Command Prompt
 /// launches and interactive PowerShell sessions. This has no effect on WSL or
 /// Git Bash sessions.

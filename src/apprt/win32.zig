@@ -4204,6 +4204,7 @@ pub const App = struct {
         } else if (!self.embedding_mode) {
             log.info("initial-window is disabled; win32 runtime waiting without a window", .{});
             if (self.config.@"windows-spare-shell") self.primeSpareShell();
+            self.warmOpenGl();
         }
 
         if (self.windows.items.len > 0) self.markRecoveryWindowCreated();
@@ -6823,6 +6824,15 @@ pub const App = struct {
                     },
                     else => return err,
                 };
+                // noctty fork: a forwarded `--working-directory=inherit` (the
+                // hand-off's own process has no folder worth inheriting) means
+                // the folder of this instance's window in front, so a "new
+                // terminal here" key needs one request, not a folder query
+                // first (omawin's Win+Enter). Home when no window of ours is
+                // in front.
+                if (forwarded_arguments != null) if (config.@"working-directory") |wd| if (wd == .inherit) {
+                    try self.applyForegroundWorkingDirectory(&config);
+                };
                 if (config.@"launch-layout") |name| {
                     const banner_host = if (self.findSurfaceForTarget(target)) |source| source.host else null;
                     _ = self.launchNamedLayout(name, banner_host);
@@ -8421,6 +8431,36 @@ pub const App = struct {
         });
     }
 
+    /// noctty fork: started with no window, load the OpenGL driver now, with a
+    /// throwaway hidden window and context, so the first window doesn't pay
+    /// for it: its context took ~93 ms against ~32 ms for later windows.
+    fn warmOpenGl(self: *App) void {
+        const hwnd = sys.CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            c.WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            null,
+            null,
+            self.hinstance,
+            null,
+        ) orelse return;
+        defer _ = sys.DestroyWindow(hwnd);
+        internal_os.omawin_trace.mark("gl-warm-start");
+        const gl = self.createGLContext(hwnd) catch |err| {
+            log.warn("OpenGL warm-up failed err={}", .{err});
+            return;
+        };
+        _ = sys.wglMakeCurrent(null, null);
+        _ = sys.wglDeleteContext(gl.hglrc);
+        _ = sys.ReleaseDC(hwnd, gl.hdc);
+        internal_os.omawin_trace.mark("gl-warm-done");
+    }
+
     fn createWindow(self: *App, title: LPCWSTR) !void {
         _ = try self.createWindowSurface(&self.config, title, .{});
     }
@@ -9075,6 +9115,20 @@ pub const App = struct {
             .app => self.hostWithNewestStructuralRedo() orelse if (self.hosts.items.len > 0) self.hosts.items[0] else null,
             .surface => null,
         };
+    }
+
+    /// The working directory of the focused pane of this instance's window in
+    /// front, or home. See the forwarded `inherit` in `.new_window`.
+    fn applyForegroundWorkingDirectory(self: *App, config: *configpkg.Config) !void {
+        config.@"working-directory" = .home;
+        const foreground = sys.GetForegroundWindow() orelse return;
+        for (self.hosts.items) |host| {
+            if (host.hwnd != foreground) continue;
+            const surface = self.activeSurfaceForHost(host.id) orelse return;
+            const pwd = (surface.core().pwd(config._arena.?.allocator()) catch null) orelse return;
+            if (pwd.len > 0) config.@"working-directory" = .{ .path = pwd };
+            return;
+        }
     }
 
     fn primarySurface(self: *App) ?*Surface {
@@ -12208,6 +12262,8 @@ const Host = struct {
     /// because the renderer thread reads it from outside the UI
     /// pump.
     is_live_resize: std.atomic.Value(bool) = .init(false),
+    /// `windows-reveal-after-placement` (noctty fork): see `Reveal`.
+    reveal: Reveal = .{},
     /// One-shot guard used by `WM_EXITSIZEMOVE`: the final layout
     /// must still defer terminal surface repaints so the explicit
     /// post-layout flush owns the single repaint request.
@@ -16420,6 +16476,106 @@ const Host = struct {
                 if (entry.view.window_visible) entry.view.noteFirstFrame(.host_shown);
             }
         }
+    }
+
+    /// noctty fork, `windows-reveal-after-placement`: a new window is shown
+    /// fully transparent (layered alpha 0: it is visible to the system, so a
+    /// window manager manages it and the renderer draws), and fades in once a
+    /// window manager has moved it, a frame after the move so the first thing
+    /// seen is the window at its tiled size. Nothing moves it within
+    /// `fallback_ms` (floating, no window manager): it fades in anyway.
+    const Reveal = struct {
+        state: enum { off, waiting, fading } = .off,
+        /// The layered alpha it fades to: `background-opacity`'s, or 255.
+        target: u8 = 255,
+        /// Whether the window was layered before (`background-opacity` < 1);
+        /// if not, the style is removed again at the end.
+        was_layered: bool = false,
+        /// When the fade starts (`GetTickCount64`).
+        start_ms: u64 = 0,
+
+        const fallback_ms = 200;
+        const settle_ms = 30;
+        const fade_ms = 120;
+        const tick_ms = 15;
+    };
+
+    /// Before the first show: make the window transparent and start waiting.
+    fn beginReveal(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        var ex_style: u32 = @intCast(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, c.GWL_EXSTYLE))));
+        const layered = (ex_style & c.WS_EX_LAYERED) != 0;
+        var target: u8 = 255;
+        if (layered) {
+            var alpha: u8 = 255;
+            var flags: u32 = 0;
+            if (sys.GetLayeredWindowAttributes(hwnd, null, &alpha, &flags) != 0 and (flags & c.LWA_ALPHA) != 0) target = alpha;
+        } else {
+            ex_style |= c.WS_EX_LAYERED;
+            _ = sys.SetWindowLongPtrW(hwnd, c.GWL_EXSTYLE, @bitCast(@as(isize, @intCast(ex_style))));
+        }
+        self.reveal = .{ .target = target, .was_layered = layered };
+        if (sys.SetLayeredWindowAttributes(hwnd, 0, 0, c.LWA_ALPHA) == 0) {
+            self.finishReveal();
+            return;
+        }
+        self.reveal.state = .waiting;
+        _ = sys.SetTimer(hwnd, c.REVEAL_TIMER_ID, Reveal.fallback_ms, null);
+    }
+
+    /// A WM_WINDOWPOSCHANGED: a move or resize of the shown window, other than
+    /// the show itself, is the window manager placing it.
+    fn noteRevealPlacement(self: *Host, pos: *const WINDOWPOS) void {
+        if (self.reveal.state != .waiting) return;
+        const swp_showwindow: u32 = 0x0040;
+        if ((pos.flags & swp_showwindow) != 0) return;
+        if ((pos.flags & c.SWP_NOMOVE) != 0 and (pos.flags & c.SWP_NOSIZE) != 0) return;
+        const hwnd = self.hwnd orelse return;
+        if (sys.IsWindowVisible(hwnd) == 0) return;
+        internal_os.omawin_trace.mark("window-placed");
+        self.startRevealFade(Reveal.settle_ms);
+    }
+
+    fn startRevealFade(self: *Host, delay_ms: u64) void {
+        const hwnd = self.hwnd orelse return;
+        self.reveal.state = .fading;
+        self.reveal.start_ms = sys.GetTickCount64() + delay_ms;
+        _ = sys.SetTimer(hwnd, c.REVEAL_TIMER_ID, Reveal.tick_ms, null);
+    }
+
+    fn tickReveal(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        switch (self.reveal.state) {
+            .off => {
+                _ = sys.KillTimer(hwnd, c.REVEAL_TIMER_ID);
+                return;
+            },
+            // Nothing placed it in time.
+            .waiting => return self.startRevealFade(0),
+            .fading => {},
+        }
+        const now = sys.GetTickCount64();
+        if (now < self.reveal.start_ms) return;
+        const t = @min(1.0, @as(f32, @floatFromInt(now - self.reveal.start_ms)) / @as(f32, Reveal.fade_ms));
+        if (t >= 1.0) return self.finishReveal();
+        const eased = 1.0 - std.math.pow(f32, 1.0 - t, 3);
+        const alpha: u8 = @intFromFloat(@round(eased * @as(f32, @floatFromInt(self.reveal.target))));
+        _ = sys.SetLayeredWindowAttributes(hwnd, 0, alpha, c.LWA_ALPHA);
+    }
+
+    fn finishReveal(self: *Host) void {
+        const hwnd = self.hwnd orelse return;
+        _ = sys.KillTimer(hwnd, c.REVEAL_TIMER_ID);
+        if (self.reveal.was_layered) {
+            _ = sys.SetLayeredWindowAttributes(hwnd, 0, self.reveal.target, c.LWA_ALPHA);
+        } else {
+            var ex_style: u32 = @intCast(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, c.GWL_EXSTYLE))));
+            ex_style &= ~@as(u32, c.WS_EX_LAYERED);
+            _ = sys.SetWindowLongPtrW(hwnd, c.GWL_EXSTYLE, @bitCast(@as(isize, @intCast(ex_style))));
+            _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE | c.SWP_FRAMECHANGED);
+        }
+        self.reveal = .{};
+        internal_os.omawin_trace.mark("revealed");
     }
 
     fn present(self: *Host) void {
@@ -28495,6 +28651,10 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 if (host) |v| v.tickTweens();
                 return 0;
             }
+            if (wParam == c.REVEAL_TIMER_ID) {
+                if (host) |v| v.tickReveal();
+                return 0;
+            }
             if (wParam == c.SEARCH_TIMER_ID) {
                 if (host) |v| v.tickSearchBars();
                 return 0;
@@ -29071,6 +29231,9 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
 
         c.WM_WINDOWPOSCHANGED => {
             const result = sys.DefWindowProcW(hwnd, msg, wParam, lParam);
+            if (host) |v| if (v.reveal.state == .waiting and lParam != 0) {
+                v.noteRevealPlacement(@ptrFromInt(@as(usize, @bitCast(lParam))));
+            };
             // This fires once per mouse-move during a drag-move/resize and
             // the visibility query costs a DWM round-trip, so skip it while
             // a drag is in flight -- a window being dragged is by definition
@@ -30762,7 +30925,9 @@ pub const Surface = struct {
         self.noteBenchmarkMemoryStage(.child_hwnd_created, null);
 
         if (app.test_surface_init_stage) |stage| try stage(self, .gl_context) else {
+            internal_os.omawin_trace.mark("gl-start");
             const gl = try app.createGLContext(hwnd);
+            internal_os.omawin_trace.mark("gl-done");
             self.hdc = gl.hdc;
             self.hglrc = gl.hglrc;
             // Must precede the stage note: `MemoryStageTrace.note` only emits
@@ -30938,6 +31103,7 @@ pub const Surface = struct {
             // opaque-then-fade flash. No unit test observes that ordering
             // — see the doc comment on `applyInitialBackgroundOpacity`.
             self.applyInitialBackgroundOpacity(opts.clone_state_from);
+            if (app.config.@"windows-reveal-after-placement") host.beginReveal();
             try host.refreshChrome();
             try host.layout();
             // The top-level host was created hidden and stays hidden until GL

@@ -816,11 +816,13 @@ pub fn init(
 
     // Setup our font group. This will reuse an existing font group if
     // it was already loaded.
+    internal_os.omawin_trace.mark("fonts-start");
     const font_grid_key, const font_grid = try app.font_grid_set.ref(
         &derived_config.font,
         font_size,
     );
     errdefer app.font_grid_set.deref(font_grid_key);
+    internal_os.omawin_trace.mark("fonts-done");
 
     // Build our size struct which has all the sizes we need.
     const size: rendererpkg.Size = size: {

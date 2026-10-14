@@ -301,6 +301,8 @@ pub const RESIZE_SETTLE_TIMER_INTERVAL_MS: UINT = 16;
 pub const TERMINAL_UIA_TIMER_ID: UINT_PTR = 0x77684705; // "whgT5" in 32-bit hex
 /// One-shot expiry of an `.info` host banner; see `Host.syncBannerExpiry`.
 pub const BANNER_TIMER_ID: UINT_PTR = 0x77684706; // "whgT6" in 32-bit hex
+/// noctty fork: `windows-reveal-after-placement`'s wait and fade (`Host.Reveal`).
+pub const REVEAL_TIMER_ID: UINT_PTR = 0x77684707; // "whgT7" in 32-bit hex
 pub const RESIZE_SETTLE_REPAINT_TICKS: u8 = 12;
 pub const FW_NORMAL: i32 = 400;
 pub const DEFAULT_CHARSET: u8 = 1;
