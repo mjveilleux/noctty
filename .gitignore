@@ -61,3 +61,6 @@ vgcore.*
 # Local flagship verification evidence.
 /test/windows/flagship/artifacts/
 /dist/artifacts/
+
+# omawin release staging (scripts/omawin-release.ps1)
+dist/omawin/
