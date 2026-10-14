@@ -16,6 +16,8 @@ const windows_ssh_hosts = @import("../config/windows_ssh_hosts.zig");
 const input = @import("../input.zig");
 const homedir = @import("../os/homedir.zig");
 const internal_os = @import("../os/main.zig");
+const termio = @import("../termio.zig");
+const global_state = &@import("../global.zig").state;
 const terminal = @import("../terminal/main.zig");
 const rendererpkg = @import("../renderer.zig");
 const ptypkg = @import("../pty.zig");
@@ -2272,7 +2274,10 @@ fn handleIpcClient(app: *App, pipe: windows.HANDLE) !win32_ipc.RequestKind {
     };
 
     switch (kind) {
-        .new_window => handleNewWindowIpcClient(app, pipe) catch |err| {
+        .new_window => handleNewWindowIpcClient(app, pipe: {
+            internal_os.omawin_trace.mark("ipc-new-window");
+            break :pipe pipe;
+        }) catch |err| {
             log.warn("failed to process win32 new-window IPC request err={}", .{err});
             try win32_ipc.writeAck(pipe, false);
         },
@@ -4198,6 +4203,7 @@ pub const App = struct {
             }
         } else if (!self.embedding_mode) {
             log.info("initial-window is disabled; win32 runtime waiting without a window", .{});
+            if (self.config.@"windows-spare-shell") self.primeSpareShell();
         }
 
         if (self.windows.items.len > 0) self.markRecoveryWindowCreated();
@@ -8173,6 +8179,7 @@ pub const App = struct {
         title: LPCWSTR,
         opts: SurfaceInitOptions,
     ) !*Surface {
+        internal_os.omawin_trace.mark("surface-create");
         if (self.test_create_window_surface) |hook| {
             return try hook(self, config, title, opts);
         }
@@ -8372,6 +8379,46 @@ pub const App = struct {
             try appendOwnedString(self.core_app.alloc, &surface.tab_title_override, alias);
         }
         return surface;
+    }
+
+    /// noctty fork: started with no window, make the spare shell now, as the
+    /// first window will launch it (a plain shell in the home folder, which is
+    /// where omawin opens one), so that window gets one too. Later spares
+    /// follow the windows (see `termio.Exec.primeSpareShell`).
+    fn primeSpareShell(self: *App) void {
+        const alloc = self.core_app.alloc;
+        const config = &self.config;
+        var env = Surface.termioEnv(alloc) catch |err| {
+            log.warn("spare shell environment failed err={}", .{err});
+            return;
+        };
+        env.remove("GHOSTTY_LOG");
+        var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home = (internal_os.windows.knownFolderPathUtf8(&internal_os.windows.FOLDERID_Profile, &home_buf) catch null) orelse {
+            env.deinit();
+            return;
+        };
+        const plan = apprt.win32_job_object.configPlan(config) catch {
+            env.deinit();
+            return;
+        };
+        termio.Exec.primeSpareShell(alloc, .{
+            .command = config.command,
+            .env = env,
+            .env_override = config.env,
+            .shell_integration = config.@"shell-integration",
+            .shell_integration_features = config.@"shell-integration-features",
+            .utf8_console = config.@"utf8-console",
+            .cursor_blink = config.@"cursor-style-blink",
+            .working_directory = home,
+            .working_directory_home = false,
+            .resources_dir = global_state.resources_dir.host(),
+            .term = config.term,
+            .rt_pre_exec_info = .init(config),
+            .rt_post_fork_info = .init(config),
+            .windows_job_object_plan = plan,
+            .windows_spare_shell = true,
+        });
     }
 
     fn createWindow(self: *App, title: LPCWSTR) !void {
@@ -31728,7 +31775,13 @@ pub const Surface = struct {
     }
 
     pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
-        var env = try internal_os.getEnvMap(self.app.core_app.alloc);
+        return termioEnv(self.app.core_app.alloc);
+    }
+
+    /// A surface's shell environment: this process's, plus the folders a
+    /// shell expects. Also what `App.primeSpareShell` launches with.
+    fn termioEnv(alloc: Allocator) !std.process.EnvMap {
+        var env = try internal_os.getEnvMap(alloc);
         errdefer env.deinit();
 
         if (env.get("USERPROFILE") == null) {
@@ -31954,6 +32007,10 @@ pub const Surface = struct {
     /// been committed. An invalidate that the normal pump answers is enough,
     /// because the pump is running by the time anything can observe it.
     fn noteFirstFrame(self: *Surface, event: first_frame.Event) void {
+        if (event == .host_shown and !self.first_frame.shown_requested)
+            internal_os.omawin_trace.mark("window-shown");
+        if (event == .content_presented and !self.first_frame.settled)
+            internal_os.omawin_trace.mark("first-frame");
         switch (self.first_frame.observe(event)) {
             .none => {},
             .request_frame => self.requestFirstFrame(),

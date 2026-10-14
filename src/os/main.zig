@@ -58,6 +58,7 @@ const kernel_info = if (builtin.os.tag == .linux) @import("kernel_info.zig") els
 pub const args = @import("args.zig");
 pub const cgroup = @import("cgroup.zig");
 pub const hostname = @import("hostname.zig");
+pub const omawin_trace = @import("omawin_trace.zig");
 pub const i18n = @import("i18n.zig");
 pub const mach = if (builtin.os.tag.isDarwin()) @import("mach.zig") else struct {};
 pub const path = @import("path.zig");

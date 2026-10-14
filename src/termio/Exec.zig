@@ -196,6 +196,22 @@ pub fn deinit(self: *Exec) void {
     self.subprocess.deinit();
 }
 
+/// noctty fork: start a spare shell (see `SpareShell`) before any surface
+/// exists, for a process started with no window, so its first window gets one
+/// too. `cfg` has to say exactly what that window will launch, or the spare
+/// won't match it. The size is a guess; the window resizes it.
+pub fn primeSpareShell(alloc: Allocator, cfg: Config) void {
+    if (comptime builtin.os.tag != .windows) return;
+    var sub = Subprocess.init(alloc, cfg) catch |err| {
+        log.warn("spare shell setup failed err={}", .{err});
+        return;
+    };
+    defer sub.deinit();
+    sub.grid_size = .{ .columns = 120, .rows = 30 };
+    if (!SpareShell.eligible(&sub)) return;
+    SpareShell.refill(&sub, SpareShell.key(&sub), 0);
+}
+
 /// Call to initialize the terminal state as necessary for this backend.
 /// This is called before any termio begins. This should not be called
 /// after termio begins because it may put the internal terminal state
@@ -267,6 +283,7 @@ pub fn threadEnter(
         }
     };
     errdefer self.subprocess.stop();
+    internal_os.omawin_trace.mark("shell-ready");
 
     // Watcher to detect subprocess exit
     const is_adopted = if (comptime builtin.os.tag == .windows)
@@ -310,7 +327,7 @@ pub fn threadEnter(
         try std.Thread.spawn(
             internal_os.surfaceThreadSpawnConfig(),
             ReadThread.threadMainWindows,
-            .{ pty_fds.read, io, pipe[0], self.subprocess.adopted_client_process, process_start },
+            .{ pty_fds.read, io, pipe[0], self.subprocess.adopted_client_process, process_start, self.subprocess.spare_output },
         )
     else
         try std.Thread.spawn(
@@ -805,6 +822,7 @@ const SpareShell = if (builtin.os.tag == .windows) struct {
     const Slot = struct {
         key: u64,
         sub: Subprocess,
+        holder: *Holder,
     };
 
     var mutex: std.Thread.Mutex = .{};
@@ -885,32 +903,39 @@ const SpareShell = if (builtin.os.tag == .windows) struct {
         };
     }
 
+    /// A spare the slot has handed out: its subprocess, and what its shell
+    /// wrote while it waited, for the taking surface to process first.
+    const Taken = struct {
+        sub: Subprocess,
+        output: []u8,
+    };
+
     /// The spare for `k`, if there is one and its shell is still running.
-    fn take(k: u64) ?Subprocess {
-        const sub = sub: {
+    fn take(k: u64) ?Taken {
+        const current = current: {
             mutex.lock();
             defer mutex.unlock();
-            const current = slot orelse return null;
-            if (current.key != k) return null;
+            const value = slot orelse return null;
+            if (value.key != k) return null;
             slot = null;
-            break :sub current.sub;
+            break :current value;
         };
-        var spare = sub;
-        const handle = (spare.process orelse {
-            spare.deinit();
-            return null;
-        }).fork_exec.pid orelse {
-            spare.deinit();
-            return null;
+        var spare = current.sub;
+        const output = current.holder.finish();
+        const alive = alive: {
+            const process = spare.process orelse break :alive false;
+            const handle = process.fork_exec.pid orelse break :alive false;
+            var exit_code: windows.DWORD = 0;
+            const still_active: windows.DWORD = 259;
+            break :alive windows.kernel32.GetExitCodeProcess(handle, &exit_code) != 0 and exit_code == still_active;
         };
-        var exit_code: windows.DWORD = 0;
-        const still_active: windows.DWORD = 259;
-        if (windows.kernel32.GetExitCodeProcess(handle, &exit_code) == 0 or exit_code != still_active) {
+        if (!alive) {
             log.info("spare shell had exited, starting a new shell instead", .{});
+            std.heap.page_allocator.free(output);
             spare.deinit();
             return null;
         }
-        return spare;
+        return .{ .sub = spare, .output = output };
     }
 
     /// Start a spare like `sub` on its own thread, `delay_ms` from now, and
@@ -940,30 +965,106 @@ const SpareShell = if (builtin.os.tag == .windows) struct {
 
     fn run(copy: Subprocess, k: u64, delay_ms: u64) void {
         std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+        internal_os.omawin_trace.mark("spare-start");
         var sub = copy;
-        _ = sub.start(std.heap.page_allocator) catch |err| {
+        const fds = sub.start(std.heap.page_allocator) catch |err| {
             log.warn("spare shell start failed err={}", .{err});
             sub.deinit();
             finishRefill(null);
             return;
         };
+        const holder = Holder.start(fds.read, fds.write) catch |err| {
+            log.warn("spare shell output holder failed err={}", .{err});
+            sub.deinit();
+            finishRefill(null);
+            return;
+        };
         log.info("spare shell ready path={s}", .{sub.args[0]});
-        finishRefill(.{ .key = k, .sub = sub });
+        finishRefill(.{ .key = k, .sub = sub, .holder = holder });
     }
 
     fn finishRefill(ready: ?Slot) void {
-        var replaced: ?Subprocess = null;
+        var replaced: ?Slot = null;
         {
             mutex.lock();
             defer mutex.unlock();
             refilling = false;
             if (ready) |new| {
-                if (slot) |old| replaced = old.sub;
+                replaced = slot;
                 slot = new;
             }
         }
-        if (replaced) |*old| old.deinit();
+        if (replaced) |old| {
+            std.heap.page_allocator.free(old.holder.finish());
+            var sub = old.sub;
+            sub.deinit();
+        }
     }
+
+    /// Reads a waiting spare's output. ConPTY opens every session with a
+    /// primary device attributes query (`ESC[c`, see
+    /// docs/windows-vt-conformance.md) and holds the console's programs until
+    /// the terminal answers, so a spare nobody reads would not even start its
+    /// shell: `cmd.exe` would sit there until a window took it. This answers
+    /// the query the way noctty's terminal does and keeps every other byte, in
+    /// order, for the surface that takes the spare. The answered query is
+    /// dropped from what is kept, or that surface would answer it a second
+    /// time and the shell would read the reply as typed input.
+    const Holder = struct {
+        read: windows.HANDLE,
+        write: windows.HANDLE,
+        output: std.ArrayListUnmanaged(u8) = .empty,
+        stop: std.atomic.Value(bool) = .init(false),
+        thread: std.Thread = undefined,
+
+        const da1_query = "\x1b[c";
+        const da1_reply = "\x1b[?62;22;52c";
+
+        fn start(read: windows.HANDLE, write: windows.HANDLE) !*Holder {
+            const self = try std.heap.page_allocator.create(Holder);
+            errdefer std.heap.page_allocator.destroy(self);
+            self.* = .{ .read = read, .write = write };
+            self.thread = try std.Thread.spawn(.{}, loop, .{self});
+            return self;
+        }
+
+        fn loop(self: *Holder) void {
+            var chunk: [4096]u8 = undefined;
+            while (!self.stop.load(.acquire)) {
+                var n: windows.DWORD = 0;
+                if (windows.kernel32.ReadFile(self.read, &chunk, chunk.len, &n, null) == 0) {
+                    // `finish` cancels a pending read; `stop` decides.
+                    if (windows.kernel32.GetLastError() == .OPERATION_ABORTED) continue;
+                    return;
+                }
+                if (n == 0) return;
+                self.output.appendSlice(std.heap.page_allocator, chunk[0..n]) catch return;
+                while (std.mem.indexOf(u8, self.output.items, da1_query)) |at| {
+                    var written: windows.DWORD = 0;
+                    _ = windows.kernel32.WriteFile(self.write, da1_reply, da1_reply.len, &written, null);
+                    const items = self.output.items;
+                    std.mem.copyForwards(u8, items[at..], items[at + da1_query.len ..]);
+                    self.output.items.len -= da1_query.len;
+                }
+            }
+        }
+
+        /// Stop reading and free the holder; what was read is the caller's
+        /// (page allocator), from here on read by the caller's own reader.
+        fn finish(self: *Holder) []u8 {
+            self.stop.store(true, .release);
+            ReadThread.cancelReadUntilExit(self.read, self.thread);
+            self.thread.join();
+            // Out of memory: the output is dropped (and freed), and the surface
+            // starts from whatever the shell writes next.
+            const output = self.output.toOwnedSlice(std.heap.page_allocator) catch empty: {
+                self.output.deinit(std.heap.page_allocator);
+                break :empty @constCast(@as([]const u8, &.{}));
+            };
+            std.heap.page_allocator.destroy(self);
+            return output;
+        }
+    };
 } else struct {};
 
 const Subprocess = struct {
@@ -996,6 +1097,11 @@ const Subprocess = struct {
     /// Whether `start` may take a spare shell and start the next one. See
     /// `SpareShell`.
     spare_shell: bool = false,
+
+    /// What a taken spare's shell wrote before this surface read it (page
+    /// allocator); the read thread processes it before reading on. See
+    /// `SpareShell.Holder`.
+    spare_output: []u8 = &.{},
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -1386,6 +1492,7 @@ const Subprocess = struct {
             self.adopted_client_process = null;
         };
         if (self.env) |*env| env.deinit();
+        if (self.spare_output.len > 0) std.heap.page_allocator.free(self.spare_output);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1420,7 +1527,8 @@ const Subprocess = struct {
             const spare_key = SpareShell.key(self);
             if (SpareShell.take(spare_key)) |spare| {
                 SpareShell.refill(self, spare_key, SpareShell.refill_delay_ms_after_take);
-                return self.adoptSpare(spare);
+                self.spare_output = spare.output;
+                return self.adoptSpare(spare.sub);
             }
             SpareShell.refill(self, spare_key, SpareShell.refill_delay_ms_after_cold_start);
         };
@@ -1648,6 +1756,7 @@ const Subprocess = struct {
             self.env = null;
         }
         log.info("took spare shell path={s} pid={?}", .{ self.args[0], cmd.pid });
+        internal_os.omawin_trace.mark("spare-taken");
         return .{ .read = pty.out_pipe, .write = pty.in_pipe };
     }
 
@@ -1974,6 +2083,7 @@ pub const ReadThread = struct {
         quit: posix.fd_t,
         adopted_client_process: ?windows.HANDLE,
         process_start: std.time.Instant,
+        spare_output: []const u8,
     ) void {
         // Always close our end of the pipe when we exit. This reader stops
         // on `io.stopping` instead; only the POSIX reader polls the pipe.
@@ -1988,7 +2098,11 @@ pub const ReadThread = struct {
 
         var buf: [WINDOWS_READ_BUF_SIZE]u8 = undefined;
         const trace = io.outputTraceEnabled();
-        const output: WindowsOutput = .{ .io = io, .trace = trace };
+        var first_output = true;
+        const output: WindowsOutput = .{ .io = io, .trace = trace, .first_output = &first_output };
+        // A taken spare's shell wrote its start-up and prompt before this
+        // surface existed; that comes first.
+        if (spare_output.len > 0) output.output(spare_output, 0);
         switch (readUntilStopped(fd, &buf, &io.stopping, trace, output)) {
             .stopped => log.info("read thread got quit signal", .{}),
 
@@ -2004,8 +2118,14 @@ pub const ReadThread = struct {
     const WindowsOutput = struct {
         io: *termio.Termio,
         trace: bool,
+        /// Whether the shell's first output is still to come (omawin's timing mark).
+        first_output: *bool,
 
         fn output(self: WindowsOutput, data: []const u8, read_ns: u64) void {
+            if (self.first_output.*) {
+                self.first_output.* = false;
+                internal_os.omawin_trace.mark("first-output");
+            }
             self.io.noteWindowsPtyRead(data.len, WINDOWS_READ_BUF_SIZE, read_ns);
             const process_started = traceInstant(self.trace);
             @call(.always_inline, termio.Termio.processOutput, .{ self.io, data });
